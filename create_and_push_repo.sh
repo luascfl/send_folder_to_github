@@ -10,6 +10,7 @@ declare -A __SUBCONTAINER_COMMITS=()
 SUBCONTAINER_STATE_FILE=".subcontainers"
 SUBCONTAINER_MODE=false
 ROOT_REMOTE_URL=""
+ROOT_REPO_NAME=""
 ROOT_REPO_DIR=""
 trap '__restore_all_backups; restore_root_remote' EXIT INT TERM
 
@@ -20,10 +21,7 @@ main() {
   local repo_dir repo_name script_rel action current_branch remote_url
   repo_dir=$(pwd)
   repo_name=$(basename "$repo_dir")
-  if [[ "$repo_name" != "send_folder_to_github" ]]; then
-    echo "create_and_push_repo.sh: ignorado (diretório atual não é 'send_folder_to_github')."
-    return 0
-  fi
+  ROOT_REPO_NAME="$repo_name"
   ROOT_REPO_DIR="$repo_dir"
   script_rel=$(script_relative_path "$repo_dir")
   action=$(prompt_repo_action "$repo_name")
@@ -656,6 +654,9 @@ stage_files_excluding_script() {
   cleanup_local_backup_artifacts
   ensure_submodules_populated
   git add --all
+  if [[ "${ROOT_REPO_NAME:-}" != "send_folder_to_github" && -n "$script_rel" ]]; then
+    protect_path "$script_rel"
+  fi
   if [[ "$SUBCONTAINER_MODE" == "true" ]]; then
     enforce_subcontainer_gitlinks
   fi
