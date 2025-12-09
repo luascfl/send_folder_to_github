@@ -7,6 +7,7 @@ declare -a __UNTRACKED_BACKUPS=()
 declare -a __SUBCONTAINERS_TO_PUSH=()
 declare -a __SUBCONTAINERS_TO_CLEAR=()
 declare -A __SUBCONTAINER_COMMITS=()
+declare -a DEFAULT_INDEX_EXCLUDES=("node_modules" ".eslintcache" "dist" "build")
 SUBCONTAINER_STATE_FILE=".subcontainers"
 SUBCONTAINER_MODE=false
 ROOT_REMOTE_URL=""
@@ -24,7 +25,16 @@ main() {
   ROOT_REPO_NAME="$repo_name"
   ROOT_REPO_DIR="$repo_dir"
   script_rel=$(script_relative_path "$repo_dir")
-  action=$(prompt_repo_action "$repo_name")
+  
+  if [[ $# -gt 0 ]]; then
+    action=$1
+  else
+    if [[ -t 0 ]]; then
+      action=$(prompt_repo_action "$repo_name")
+    else
+      action="push"
+    fi
+  fi
 
   ensure_git_lfs
 
@@ -58,6 +68,9 @@ main() {
       perform_push "$script_rel" "$current_branch" "$remote_url"
       ensure_remote "$remote_url"
       clear_removed_subcontainers
+      ;;
+    push-recursive-1)
+      push_recursive_one_level
       ;;
     *)
       echo "Unknown action '$action'." >&2
@@ -162,7 +175,7 @@ PY
 prompt_repo_action() {
   local repo_name=$1 choice
   while true; do
-    if ! read -rp "Choose action for repository '$repo_name' [push/pull/push-subfolders] (default: push): " choice; then
+    if ! read -rp "Choose action for repository '$repo_name' [push/pull/push-subfolders/push-recursive-1] (default: push): " choice; then
       choice=""
     fi
     case "${choice,,}" in
@@ -172,7 +185,11 @@ prompt_repo_action() {
         echo "push-subfolders"
         return
         ;;
-      *) echo "Invalid input. Type 'push', 'pull', or 'push-subfolders'." >&2 ;;
+      push-recursive-1|push_recursive_1|pushrecursive1)
+        echo "push-recursive-1"
+        return
+        ;;
+      *) echo "Invalid input. Type 'push', 'pull', 'push-subfolders', or 'push-recursive-1'." >&2 ;;
     esac
   done
 }
@@ -289,6 +306,68 @@ perform_push() {
   else
     echo "Push failed." >&2
     exit 1
+  fi
+}
+
+push_recursive_one_level() {
+  local base_dir
+  local -a pushed=()
+  local -a ignored=()
+  local path subdir script blocker script_found
+
+  base_dir=$(pwd)
+  while IFS= read -r -d '' script_found; do
+    path=$(dirname "$script_found")
+    subdir=${path#"$base_dir"/}
+    [[ -z "$subdir" ]] && continue
+    if [[ "${subdir:0:1}" == "." ]]; then
+      continue
+    fi
+    if [[ "$subdir" == codex* ]]; then
+      ignored+=("$subdir (codex*)")
+      continue
+    fi
+    blocker="$path/create_firefox-amo_push_github.sh"
+    if [[ -f "$blocker" ]]; then
+      ignored+=("$subdir (blocking create_firefox-amo_push_github.sh)")
+      continue
+    fi
+    
+    script="$script_found"
+    
+    # Update the child script with the current master version from base_dir
+    cp "$base_dir/create_and_push_repo.sh" "$script"
+    
+    chmod +x "$script" >/dev/null 2>&1 || true
+    echo "==> push-recursive-1: pushing '$subdir' (script updated)..." >&2
+    if (
+      cd "$path" && \
+      ./create_and_push_repo.sh push < /dev/null
+    ); then
+      pushed+=("$subdir")
+    else
+      ignored+=("$subdir (push failed)")
+    fi
+  done < <(find "$base_dir" -mindepth 2 -maxdepth 2 -name "create_and_push_repo.sh" -print0 2>/dev/null)
+
+  printf '\npush-recursive-1 summary:\n' >&2
+  printf '  pushed:\n' >&2
+  if [[ ${#pushed[@]} -gt 0 ]]; then
+    local entry
+    for entry in "${pushed[@]}"; do
+      printf '    - %s\n' "$entry" >&2
+    done
+  else
+    printf '    (none)\n' >&2
+  fi
+  printf '  ignored:\n' >&2
+  if [[ ${#ignored[@]} -gt 0 ]]; then
+    local entry
+    for entry in "${ignored[@]}"; do
+      printf '    - %s\n' "$entry" >&2
+    done
+  else
+    printf '    (none)\n' >&2
   fi
 }
 
@@ -648,12 +727,22 @@ clear_subcontainer_repo() {
   fi
 }
 
+remove_paths_from_index() {
+  local path
+  for path in "$@"; do
+    [[ -z "$path" ]] && continue
+    git rm -rf --cached --ignore-unmatch -- "$path" >/dev/null 2>&1 || true
+  done
+}
+
 stage_files_excluding_script() {
   local script_rel=$1
   ensure_token_gitignore
   cleanup_local_backup_artifacts
   ensure_submodules_populated
+  remove_paths_from_index "${DEFAULT_INDEX_EXCLUDES[@]}"
   git add --all
+  remove_paths_from_index "${DEFAULT_INDEX_EXCLUDES[@]}"
   if [[ "${ROOT_REPO_NAME:-}" != "send_folder_to_github" && -n "$script_rel" ]]; then
     protect_path "$script_rel"
   fi
@@ -771,6 +860,11 @@ ensure_token_gitignore() {
     "AMO_API_KEY.txt"
     "AMO_API_SECRET.txt"
     "*API*"
+    ".eslintcache/"
+    "node_modules/"
+    "dist/"
+    "build/"
+    "*.zip"
   )
   if [[ ! -f $gitignore ]]; then
     printf "%s\n" "${entries[@]}" > "$gitignore"
