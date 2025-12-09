@@ -313,33 +313,37 @@ push_recursive_one_level() {
   local base_dir
   local -a pushed=()
   local -a ignored=()
-  local path subdir script blocker script_found
+  local path subdir script blocker
 
   base_dir=$(pwd)
-  while IFS= read -r -d '' script_found; do
-    path=$(dirname "$script_found")
+  while IFS= read -r -d '' path; do
     subdir=${path#"$base_dir"/}
     [[ -z "$subdir" ]] && continue
-        if [[ "${subdir:0:1}" == "." ]]; then
-          continue
-        fi
+    if [[ "${subdir:0:1}" == "." ]]; then
+      continue
+    fi
     
-        script="$script_found"
-        # Update the child script with the current master version from base_dir
-        cp "$base_dir/create_and_push_repo.sh" "$script"
-        chmod +x "$script" >/dev/null 2>&1 || true
+    if [[ "$subdir" == codex* ]]; then
+      ignored+=("$subdir (codex*)")
+      continue
+    fi
     
-        if [[ "$subdir" == codex* ]]; then
-          ignored+=("$subdir (codex*)")
-          continue
-        fi
-        
-        blocker="$path/create_firefox-amo_push_github.sh"
+    blocker="$path/create_firefox-amo_push_github.sh"
     if [[ -f "$blocker" ]]; then
       ignored+=("$subdir (blocking create_firefox-amo_push_github.sh)")
       continue
     fi
-    
+
+    script="$path/create_and_push_repo.sh"
+    if [[ ! -f "$script" ]]; then
+      # Silent skip for unrelated folders
+      continue
+    fi
+
+    # Update the child script with the current master version from base_dir
+    cp "$base_dir/create_and_push_repo.sh" "$script"
+    chmod +x "$script" >/dev/null 2>&1 || true
+
     echo "==> push-recursive-1: pushing '$subdir' (script updated)..." >&2
     if (
       cd "$path" && \
@@ -349,10 +353,9 @@ push_recursive_one_level() {
     else
       ignored+=("$subdir (push failed)")
     fi
-  done < <(find "$base_dir" -mindepth 2 -maxdepth 2 -name "create_and_push_repo.sh" -print0 2>/dev/null)
+  done < <(find "$base_dir" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
 
-  printf '\npush-recursive-1 summary:\n' >&2
-  printf '  pushed:\n' >&2
+  printf '\npush-recursive-1 summary:\n' >&2  printf '  pushed:\n' >&2
   if [[ ${#pushed[@]} -gt 0 ]]; then
     local entry
     for entry in "${pushed[@]}"; do
