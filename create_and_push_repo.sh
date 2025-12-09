@@ -327,18 +327,18 @@ push_recursive_one_level() {
       ignored+=("$subdir (codex*)")
       continue
     fi
+    script="$script_found"
+    
+    # Update the child script with the current master version from base_dir
+    cp "$base_dir/create_and_push_repo.sh" "$script"
+    chmod +x "$script" >/dev/null 2>&1 || true
+
     blocker="$path/create_firefox-amo_push_github.sh"
     if [[ -f "$blocker" ]]; then
       ignored+=("$subdir (blocking create_firefox-amo_push_github.sh)")
       continue
     fi
     
-    script="$script_found"
-    
-    # Update the child script with the current master version from base_dir
-    cp "$base_dir/create_and_push_repo.sh" "$script"
-    
-    chmod +x "$script" >/dev/null 2>&1 || true
     echo "==> push-recursive-1: pushing '$subdir' (script updated)..." >&2
     if (
       cd "$path" && \
