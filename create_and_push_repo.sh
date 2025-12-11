@@ -8,6 +8,7 @@ declare -a __SUBCONTAINERS_TO_PUSH=()
 declare -a __SUBCONTAINERS_TO_CLEAR=()
 declare -A __SUBCONTAINER_COMMITS=()
 declare -a DEFAULT_INDEX_EXCLUDES=("node_modules" ".eslintcache" "dist" "build")
+declare -a SENSITIVE_PATHS=("GITHUB_TOKEN" "GITHUB_TOKEN.txt" "AMO_API_KEY.txt" "AMO_API_SECRET.txt")
 SUBCONTAINER_STATE_FILE=".subcontainers"
 SUBCONTAINER_MODE=false
 ROOT_REMOTE_URL=""
@@ -484,17 +485,47 @@ ensure_submodule_remote() {
   fi
 }
 
+stage_submodule_changes() {
+  local subdir=$1
+  (
+    cd "$subdir" || return
+    ensure_token_gitignore
+    cleanup_local_backup_artifacts
+    remove_paths_from_index "${DEFAULT_INDEX_EXCLUDES[@]}"
+    git add --all
+    remove_paths_from_index "${DEFAULT_INDEX_EXCLUDES[@]}"
+    purge_sensitive_paths_from_index "."
+    protect_path "GITHUB_TOKEN"
+    protect_path "GITHUB_TOKEN.txt"
+    protect_path "AMO_API_KEY.txt"
+    protect_path "AMO_API_SECRET.txt"
+  )
+}
+
 commit_and_push_submodule() {
   local subdir=$1
-  git -C "$subdir" add --all
+  stage_submodule_changes "$subdir"
   ensure_lfs_for_large_files "$subdir"
   if git -C "$subdir" diff --staged --quiet; then
     :
   else
-    git -C "$subdir" commit -m "push"
+    commit_submodule_safely "$subdir"
   fi
   ensure_submodule_initial_commit "$subdir"
   push_submodule_with_credentials "$subdir"
+}
+
+commit_submodule_safely() {
+  local subdir=$1 has_upstream=1
+  if ! git -C "$subdir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+    has_upstream=0
+  fi
+
+  if git -C "$subdir" rev-parse --verify HEAD >/dev/null 2>&1 && [[ $has_upstream -eq 0 ]]; then
+    git -C "$subdir" commit --amend --no-edit
+  else
+    git -C "$subdir" commit -m "push"
+  fi
 }
 
 ensure_submodule_initial_commit() {
@@ -739,6 +770,18 @@ remove_paths_from_index() {
   done
 }
 
+purge_sensitive_paths_from_index() {
+  local repo_path=${1:-.}
+  (
+    cd "$repo_path" || return 0
+    local path
+    for path in "${SENSITIVE_PATHS[@]}"; do
+      [[ -z "$path" ]] && continue
+      git rm --cached --ignore-unmatch -- "$path" >/dev/null 2>&1 || true
+    done
+  )
+}
+
 stage_files_excluding_script() {
   local script_rel=$1
   ensure_token_gitignore
@@ -747,6 +790,7 @@ stage_files_excluding_script() {
   remove_paths_from_index "${DEFAULT_INDEX_EXCLUDES[@]}"
   git add --all
   remove_paths_from_index "${DEFAULT_INDEX_EXCLUDES[@]}"
+  purge_sensitive_paths_from_index "."
   if [[ "${ROOT_REPO_NAME:-}" != "send_folder_to_github" && -n "$script_rel" ]]; then
     protect_path "$script_rel"
   fi
