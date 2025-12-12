@@ -590,6 +590,9 @@ stage_submodule_changes() {
     git add --all
     remove_paths_from_index "${DEFAULT_INDEX_EXCLUDES[@]}"
     purge_sensitive_paths_from_index "."
+    if [[ "$(basename "$subdir")" != "send_folder_to_github" ]]; then
+      protect_path "create_and_push_repo.sh"
+    fi
     protect_path "GITHUB_TOKEN"
     protect_path "GITHUB_TOKEN.txt"
     protect_path "AMO_API_KEY.txt"
