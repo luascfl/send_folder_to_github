@@ -7,7 +7,18 @@ declare -a __UNTRACKED_BACKUPS=()
 declare -a __SUBCONTAINERS_TO_PUSH=()
 declare -a __SUBCONTAINERS_TO_CLEAR=()
 declare -A __SUBCONTAINER_COMMITS=()
-declare -a DEFAULT_INDEX_EXCLUDES=("node_modules" ".eslintcache" "dist" "build")
+ROOT_TOKEN_FILE=""
+declare -a DEFAULT_INDEX_EXCLUDES=(
+  "node_modules"
+  ".eslintcache"
+  "dist"
+  "build"
+  "whatsapp-mcp/whatsapp-bridge/store/whatsapp.db"
+  "whatsapp-mcp/whatsapp-bridge/store/messages.db"
+  "meus_arquivos_mcp"
+  "go"
+  "env.sh"
+)
 declare -a SENSITIVE_PATHS=("GITHUB_TOKEN" "GITHUB_TOKEN.txt" "AMO_API_KEY.txt" "AMO_API_SECRET.txt")
 SUBCONTAINER_STATE_FILE=".subcontainers"
 SUBCONTAINER_MODE=false
@@ -17,10 +28,9 @@ ROOT_REPO_DIR=""
 trap '__restore_all_backups; restore_root_remote' EXIT INT TERM
 
 main() {
-  ensure_dependencies
-  ensure_token
-
   local repo_dir repo_name script_rel action current_branch remote_url
+  ensure_dependencies
+
   repo_dir=$(pwd)
   repo_name=$(basename "$repo_dir")
   ROOT_REPO_NAME="$repo_name"
@@ -37,6 +47,12 @@ main() {
     fi
   fi
 
+  if [[ "$action" == "reauth" ]]; then
+    reauth_github_token "$repo_dir"
+    return
+  fi
+
+  ensure_token
   ensure_git_lfs
 
   init_git_repo
@@ -101,6 +117,7 @@ ensure_git_lfs() {
 
 ensure_token() {
   if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    ROOT_TOKEN_FILE=$(pwd)/GITHUB_TOKEN.txt
     return
   fi
 
@@ -108,6 +125,7 @@ ensure_token() {
   if token_file=$(find_token_file); then
     if load_token_from_file "$token_file"; then
       export GITHUB_TOKEN
+      ROOT_TOKEN_FILE="$token_file"
       return
     fi
   fi
@@ -150,9 +168,78 @@ PY
 
   if [[ -n "$token" ]]; then
     GITHUB_TOKEN=$token
+    ROOT_TOKEN_FILE="$token_file"
     return 0
   fi
   return 1
+}
+
+propagate_token_to_subdir() {
+  local subdir=$1 target
+  target="$subdir/GITHUB_TOKEN.txt"
+
+  if [[ -n "$ROOT_TOKEN_FILE" && -f "$ROOT_TOKEN_FILE" ]]; then
+    cp "$ROOT_TOKEN_FILE" "$target"
+  elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    printf "%s\n" "$GITHUB_TOKEN" >"$target"
+  else
+    return
+  fi
+
+  chmod 600 "$target" 2>/dev/null || true
+}
+
+reauth_github_token() {
+  local repo_dir=${1:-$PWD} token target login=""
+  target="$repo_dir/GITHUB_TOKEN.txt"
+
+  echo "Re-authenticating GitHub token. It will be saved to: $target" >&2
+  read -rsp "Enter new GitHub PAT (input hidden): " token
+  echo
+  if [[ -z "$token" ]]; then
+    echo "No token provided; aborting reauth." >&2
+    exit 1
+  fi
+
+  printf "%s\n" "$token" >"$target"
+  chmod 600 "$target" 2>/dev/null || true
+  export GITHUB_TOKEN="$token"
+  ROOT_TOKEN_FILE="$target"
+
+  if validate_github_token "$token" login; then
+    echo "Token validated for GitHub user '$login' and saved to $target" >&2
+  else
+    echo "Token saved to $target but validation failed. Check scopes/network." >&2
+  fi
+}
+
+validate_github_token() {
+  local token=$1 login_var=$2 tmp status login=""
+  tmp=$(mktemp)
+  status=$(curl -sS -w "%{http_code}" -o "$tmp" \
+    -H "Authorization: token $token" \
+    -H "Accept: application/vnd.github+json" \
+    https://api.github.com/user)
+  if [[ "$status" != "200" ]]; then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  login=$(python3 - "$tmp" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    print(data.get("login", ""))
+except Exception:
+    pass
+PY
+)
+  rm -f "$tmp"
+  if [[ -n "$login_var" ]]; then
+    printf -v "$login_var" '%s' "$login"
+  fi
+  return 0
 }
 
 # Repo setup -----------------------------------------------------------------
@@ -176,7 +263,7 @@ PY
 prompt_repo_action() {
   local repo_name=$1 choice
   while true; do
-    if ! read -rp "Choose action for repository '$repo_name' [push/pull/push-subfolders/push-recursive-1] (default: push): " choice; then
+    if ! read -rp "Choose action for repository '$repo_name' [push/pull/push-subfolders/push-recursive-1/reauth] (default: push): " choice; then
       choice=""
     fi
     case "${choice,,}" in
@@ -185,12 +272,16 @@ prompt_repo_action() {
       push-subfolders|push+subfolders|push_subfolders)
         echo "push-subfolders"
         return
-        ;;
+      ;;
       push-recursive-1|push_recursive_1|pushrecursive1)
         echo "push-recursive-1"
         return
         ;;
-      *) echo "Invalid input. Type 'push', 'pull', 'push-subfolders', or 'push-recursive-1'." >&2 ;;
+      reauth|auth|token)
+        echo "reauth"
+        return
+        ;;
+      *) echo "Invalid input. Type 'push', 'pull', 'push-subfolders', 'push-recursive-1', or 'reauth'." >&2 ;;
     esac
   done
 }
@@ -340,6 +431,8 @@ push_recursive_one_level() {
       # Silent skip for unrelated folders
       continue
     fi
+
+    propagate_token_to_subdir "$path"
 
     # Update the child script with the current master version from base_dir
     cp "$base_dir/create_and_push_repo.sh" "$script"
