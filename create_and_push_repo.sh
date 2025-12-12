@@ -592,6 +592,7 @@ stage_submodule_changes() {
     purge_sensitive_paths_from_index "."
     if [[ "$(basename "$subdir")" != "send_folder_to_github" ]]; then
       protect_path "create_and_push_repo.sh"
+      remove_tracked_path "create_and_push_repo.sh"
     fi
     protect_path "GITHUB_TOKEN"
     protect_path "GITHUB_TOKEN.txt"
@@ -891,6 +892,7 @@ stage_files_excluding_script() {
   purge_sensitive_paths_from_index "."
   if [[ "${ROOT_REPO_NAME:-}" != "send_folder_to_github" && -n "$script_rel" ]]; then
     protect_path "$script_rel"
+    remove_tracked_path "$script_rel"
   fi
   if [[ "$SUBCONTAINER_MODE" == "true" ]]; then
     enforce_subcontainer_gitlinks
@@ -1035,6 +1037,12 @@ protect_path() {
     return
   fi
   git rm --cached -- "$path" >/dev/null 2>&1 || true
+}
+
+remove_tracked_path() {
+  local path=$1
+  [[ -z "$path" ]] && return
+  git rm --cached --ignore-unmatch -- "$path" >/dev/null 2>&1 || true
 }
 
 commit_changes() {
