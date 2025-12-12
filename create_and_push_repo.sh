@@ -11,6 +11,7 @@ ROOT_TOKEN_FILE=""
 declare -a DEFAULT_INDEX_EXCLUDES=(
   "node_modules"
   ".eslintcache"
+  "__pycache__"
   "dist"
   "build"
   "whatsapp-mcp/whatsapp-bridge/store/whatsapp.db"
@@ -18,6 +19,7 @@ declare -a DEFAULT_INDEX_EXCLUDES=(
   "meus_arquivos_mcp"
   "go"
   "env.sh"
+  ".gemini"
 )
 declare -a SENSITIVE_PATHS=("GITHUB_TOKEN" "GITHUB_TOKEN.txt" "AMO_API_KEY.txt" "AMO_API_SECRET.txt")
 SUBCONTAINER_STATE_FILE=".subcontainers"
@@ -996,6 +998,8 @@ ensure_token_gitignore() {
     "*.env.local"
     "*.env.development"
     "*.env.production"
+    "__pycache__/"
+    ".gemini"
     "GITHUB_TOKEN"
     "GITHUB_TOKEN.txt"
     "AMO_API_KEY.txt"
