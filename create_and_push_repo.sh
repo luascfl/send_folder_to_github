@@ -16,12 +16,13 @@ declare -a DEFAULT_INDEX_EXCLUDES=(
   "build"
   "whatsapp-mcp/whatsapp-bridge/store/whatsapp.db"
   "whatsapp-mcp/whatsapp-bridge/store/messages.db"
+  "gcp-oauth.keys.json"
   "meus_arquivos_mcp"
-  "go"
+  "go/"
   "env.sh"
   ".gemini"
 )
-declare -a SENSITIVE_PATHS=("GITHUB_TOKEN" "GITHUB_TOKEN.txt" "AMO_API_KEY.txt" "AMO_API_SECRET.txt")
+declare -a SENSITIVE_PATHS=("GITHUB_TOKEN" "GITHUB_TOKEN.txt" "AMO_API_KEY.txt" "AMO_API_SECRET.txt" "gcp-oauth.keys.json")
 SUBCONTAINER_STATE_FILE=".subcontainers"
 SUBCONTAINER_MODE=false
 ROOT_REMOTE_URL=""
