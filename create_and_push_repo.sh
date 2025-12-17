@@ -22,7 +22,7 @@ declare -a DEFAULT_INDEX_EXCLUDES=(
   "env.sh"
   ".gemini"
 )
-declare -a SENSITIVE_PATHS=("GITHUB_TOKEN" "GITHUB_TOKEN.txt" "AMO_API_KEY.txt" "AMO_API_SECRET.txt" "gcp-oauth.keys.json" "AMO_API_KEY" "AMO_API_SECRET")
+declare -a SENSITIVE_PATHS=("GITHUB_TOKEN" "GITHUB_TOKEN.txt" "AMO_API_KEY.txt" "AMO_API_SECRET.txt" "gcp-oauth.keys.json" "AMO_API_KEY" "AMO_API_SECRET" ".env" "*.env" ".env.*")
 SUBCONTAINER_STATE_FILE=".subcontainers"
 SUBCONTAINER_MODE=false
 ROOT_REMOTE_URL=""
@@ -51,7 +51,8 @@ main() {
   fi
 
   if [[ "$action" == "reauth" ]]; then
-    reauth_github_token "$repo_dir"
+    reauth_all_recursively "$repo_dir"
+    echo "Lembrete: Para carregar as variáveis no seu ambiente atual, execute com 'source' (ex: source ./create_and_push_repo.sh reauth)." >&2
     return
   fi
 
@@ -104,7 +105,9 @@ main() {
     push-firefox-amo-github)
       SUBCONTAINER_MODE=false
       ensure_amo_credentials
-      submit_extension_to_amo
+      if ! submit_extension_to_amo; then
+        echo "Aviso: Falha na submissão ao AMO. Continuando com push para GitHub..." >&2
+      fi
       ensure_remote_repo_exists "$repo_name" "$(repo_visibility_from_folder "$repo_name")"
       ensure_remote "$remote_url"
       sync_with_remote "$current_branch"
@@ -200,19 +203,48 @@ PY
   return 1
 }
 
-propagate_token_to_subdir() {
-  local subdir=$1 target
-  target="$subdir/GITHUB_TOKEN.txt"
+propagate_credentials_to_subdir() {
+  local subdir=$1
 
+  # GitHub - Propagate to all subrepos
+  local gh_target="$subdir/GITHUB_TOKEN.txt"
   if [[ -n "$ROOT_TOKEN_FILE" && -f "$ROOT_TOKEN_FILE" ]]; then
-    cp "$ROOT_TOKEN_FILE" "$target"
+    cp "$ROOT_TOKEN_FILE" "$gh_target"
   elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
-    printf "%s\n" "$GITHUB_TOKEN" >"$target"
-  else
+    printf "%s\n" "$GITHUB_TOKEN" >"$gh_target"
+  fi
+  chmod 600 "$gh_target" 2>/dev/null || true
+
+  # Check if subdir is a Firefox extension project
+  local is_firefox_extension=false
+  if [[ -n $(find "$subdir" -maxdepth 1 -name "manifest*.json" -print -quit) ]] || \
+     [[ -n $(find "$subdir" -maxdepth 1 -name "*.xpi" -print -quit) ]]; then
+    is_firefox_extension=true
+  fi
+
+  if [[ "$is_firefox_extension" == "false" ]]; then
     return
   fi
 
-  chmod 600 "$target" 2>/dev/null || true
+  # AMO Key - Propagate only to extensions
+  local amo_key_target="$subdir/AMO_API_KEY.txt"
+  if [[ -f "AMO_API_KEY.txt" ]]; then
+    cp "AMO_API_KEY.txt" "$amo_key_target"
+    chmod 600 "$amo_key_target" 2>/dev/null || true
+  elif [[ -n "${AMO_API_KEY:-}" ]]; then
+     printf "%s\n" "$AMO_API_KEY" >"$amo_key_target"
+     chmod 600 "$amo_key_target" 2>/dev/null || true
+  fi
+
+  # AMO Secret - Propagate only to extensions
+  local amo_secret_target="$subdir/AMO_API_SECRET.txt"
+  if [[ -f "AMO_API_SECRET.txt" ]]; then
+    cp "AMO_API_SECRET.txt" "$amo_secret_target"
+    chmod 600 "$amo_secret_target" 2>/dev/null || true
+  elif [[ -n "${AMO_API_SECRET:-}" ]]; then
+     printf "%s\n" "$AMO_API_SECRET" >"$amo_secret_target"
+     chmod 600 "$amo_secret_target" 2>/dev/null || true
+  fi
 }
 
 reauth_github_token() {
@@ -220,15 +252,23 @@ reauth_github_token() {
   target="$repo_dir/GITHUB_TOKEN.txt"
 
   echo "Re-authenticating GitHub token. It will be saved to: $target" >&2
-  read -rsp "Enter new GitHub PAT (input hidden): " token
+  read -rsp "Enter new GitHub PAT (input hidden, leave blank to skip): " token
   echo
   if [[ -z "$token" ]]; then
-    echo "No token provided; aborting reauth." >&2
-    exit 1
+    echo "GitHub token update skipped." >&2
+    return
   fi
 
   printf "%s\n" "$token" >"$target"
   chmod 600 "$target" 2>/dev/null || true
+  
+  local central_target="/home/lucas/Downloads/GITHUB_TOKEN.txt"
+  if [[ "$(realpath "$target")" != "$(realpath "$central_target")" ]]; then
+     cp "$target" "$central_target"
+     chmod 600 "$central_target" 2>/dev/null || true
+     echo "Token backup updated at $central_target" >&2
+  fi
+
   export GITHUB_TOKEN="$token"
   ROOT_TOKEN_FILE="$target"
 
@@ -266,6 +306,77 @@ PY
     printf -v "$login_var" '%s' "$login"
   fi
   return 0
+}
+
+reauth_amo_credentials() {
+  local repo_dir=$1 key secret
+  local key_file="$repo_dir/AMO_API_KEY.txt"
+  local secret_file="$repo_dir/AMO_API_SECRET.txt"
+  local central_key="/home/lucas/Downloads/AMO_API_KEY.txt"
+  local central_secret="/home/lucas/Downloads/AMO_API_SECRET.txt"
+
+  echo "Updating AMO Credentials..." >&2
+  read -rsp "Enter AMO API Key (Issuer): " key
+  echo
+  if [[ -n "$key" ]]; then
+    printf "%s\n" "$key" >"$key_file"
+    chmod 600 "$key_file" 2>/dev/null || true
+    
+    if [[ "$(realpath "$key_file")" != "$(realpath "$central_key")" ]]; then
+      cp "$key_file" "$central_key"
+      chmod 600 "$central_key" 2>/dev/null || true
+      echo "AMO Key backup updated at $central_key" >&2
+    fi
+    
+    export AMO_API_KEY="$key"
+    echo "AMO API Key saved to $key_file" >&2
+  fi
+
+  read -rsp "Enter AMO API Secret: " secret
+  echo
+  if [[ -n "$secret" ]]; then
+    printf "%s\n" "$secret" >"$secret_file"
+    chmod 600 "$secret_file" 2>/dev/null || true
+    
+    if [[ "$(realpath "$secret_file")" != "$(realpath "$central_secret")" ]]; then
+      cp "$secret_file" "$central_secret"
+      chmod 600 "$central_secret" 2>/dev/null || true
+      echo "AMO Secret backup updated at $central_secret" >&2
+    fi
+
+    export AMO_API_SECRET="$secret"
+    echo "AMO API Secret saved to $secret_file" >&2
+  fi
+}
+
+reauth_all_recursively() {
+  local repo_dir=$1
+  
+  # 1. GitHub
+  reauth_github_token "$repo_dir"
+
+  # 2. AMO
+  echo
+  read -rp "Do you want to update Firefox AMO credentials? [y/N] " yesno
+  if [[ "$yesno" =~ ^[Yy]$ ]]; then
+    reauth_amo_credentials "$repo_dir"
+  fi
+
+  # 3. Recursion
+  echo
+  echo "Propagating credentials to immediate subdirectories..."
+  local base_dir=$repo_dir
+  local path subdir
+  while IFS= read -r -d '' path; do
+    subdir=${path#"$base_dir"/}
+    [[ -z "$subdir" || "${subdir:0:1}" == "." ]] && continue
+    
+    if [[ -f "$path/create_and_push_repo.sh" ]]; then
+       echo "  -> $subdir"
+       propagate_credentials_to_subdir "$path"
+    fi
+  done < <(find "$base_dir" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+  echo "Credentials propagation complete."
 }
 
 # AMO Credentials ------------------------------------------------------------
@@ -357,6 +468,30 @@ submit_extension_to_amo() {
   local artifacts_dir=${AMO_ARTIFACTS_DIR:-.web-ext-artifacts}
   mkdir -p "$artifacts_dir"
 
+  # Manifest Swapping Logic
+  local original_manifest="manifest.json"
+  local firefox_manifest=""
+  local backup_manifest="manifest.json.bak_amo"
+  local swapped=0
+
+  if [[ -f "manifest-firefox-mv3.json" ]]; then
+    firefox_manifest="manifest-firefox-mv3.json"
+  elif [[ -f "manifest-firefox-mv2.json" ]]; then
+    firefox_manifest="manifest-firefox-mv2.json"
+  fi
+
+  if [[ -n "$firefox_manifest" ]]; then
+    echo "Hybrid repo detected: Swapping $firefox_manifest to manifest.json for AMO submission..." >&2
+    if [[ -f "$original_manifest" ]]; then
+      cp "$original_manifest" "$backup_manifest"
+    fi
+    cp "$firefox_manifest" "$original_manifest"
+    swapped=1
+  fi
+
+  # AUTO-FIX VALIDATION ERRORS
+  fix_manifest_errors "$original_manifest"
+
   local metadata_file=${AMO_METADATA_FILE:-amo-metadata.json}
   if [[ ! -f "$metadata_file" ]]; then
     cat >"$metadata_file" <<'EOF'
@@ -381,6 +516,7 @@ EOF
     --channel "$channel"
     --artifacts-dir "$artifacts_dir"
     --amo-metadata "$metadata_file"
+    --ignore-files "AMO_API_KEY.txt" "AMO_API_SECRET.txt" "GITHUB_TOKEN.txt" "create_and_push_repo.sh" "create_firefox-amo_push_github.sh" "*.sh" ".env*" "screenshots/" ".git/" ".web-ext-artifacts/"
   )
 
   if [[ -n "${AMO_SOURCE_DIR:-}" ]]; then
@@ -388,16 +524,116 @@ EOF
   fi
 
   echo "Enviando extensão ao Firefox AMO (canal: $channel)..." >&2
-  "${cmd[@]}"
-  echo "Submissão ao AMO concluída." >&2
+  
+  local final_status=0
+  
+  # LOOP FOR RETRY (THROTTLING)
+  while true; do
+      set +e
+      # Execute web-ext in background and monitor output for early success
+      rm -f web-ext-output.log
+      "${cmd[@]}" > web-ext-output.log 2>&1 &
+      local pid=$!
+      
+      local start_time=$(date +%s)
+      local max_wait=600 # 10 min hard timeout
+      local found_success=0
+      
+      echo "Monitorando submissão (PID $pid)..." >&2
+      
+      # Wait for log creation
+      while [[ ! -f web-ext-output.log ]] && kill -0 $pid 2>/dev/null; do sleep 0.5; done
+
+      while kill -0 $pid 2>/dev/null; do
+        if (( $(date +%s) - start_time > max_wait )); then
+          echo "Timeout atingido. Encerrando..." >&2
+          kill $pid
+          break
+        fi
+
+        if grep -Eq "Waiting for approval|Your add-on has been submitted|Validation results:" web-ext-output.log; then
+           echo "Sucesso na submissão detectado! Encerrando espera..." >&2
+           kill $pid 2>/dev/null || true
+           found_success=1
+           break
+        fi
+        
+        sleep 2
+      done
+      
+      wait $pid 2>/dev/null
+      local exit_code=$?
+      set -e
+      
+      if [[ $found_success -eq 1 ]]; then
+        final_status=0
+        break # Success!
+      else
+        final_status=$exit_code
+      fi
+
+      if [[ $final_status -ne 0 ]]; then
+          # Check for Throttling
+          local wait_seconds
+          wait_seconds=$(python3 - <<'PY'
+import sys, re
+try:
+    with open("web-ext-output.log", "r", encoding="utf-8", errors="ignore") as f:
+        content = f.read()
+        m = re.search(r"Expected available in (\d+) seconds", content)
+        if m:
+            print(m.group(1))
+except:
+    pass
+PY
+)
+          if [[ -n "$wait_seconds" ]]; then
+              local sleep_time=$((wait_seconds + 5))
+              echo "Throttling detectado. O AMO pediu para esperar $wait_seconds segundos." >&2
+              echo "Aguardando $sleep_time segundos antes de tentar novamente..." >&2
+              sleep "$sleep_time"
+              echo "Retentando..." >&2
+              continue # Retry loop
+          else
+              # Not a throttling error, break and fail
+              cat web-ext-output.log >&2
+              break
+          fi
+      else
+          # Success (exit code 0 natural)
+          echo "Log de sucesso (tail):" >&2
+          tail -n 5 web-ext-output.log >&2
+          break
+      fi
+  done
+  
+  rm -f web-ext-output.log
+
+  # Restore Original Manifest
+  if [[ $swapped -eq 1 ]]; then
+    echo "Restoring original manifest..." >&2
+    if [[ -f "$backup_manifest" ]]; then
+      mv "$backup_manifest" "$original_manifest"
+    else
+      rm "$original_manifest"
+    fi
+  fi
+
+  if [[ $final_status -ne 0 ]]; then
+    echo "Erro: Falha na submissão ao AMO. (Status $final_status)" >&2
+    return 1
+  fi
+
+  echo "Submissão ao AMO concluída com sucesso." >&2
+  return 0
 }
 
 ensure_webext_ignore() {
   local ignore_file=".web-extignore"
   local entries=(
-    ".git/"
-    ".github/"
-    ".web-ext-artifacts/"
+    ".git"
+    ".github"
+    ".web-ext-artifacts"
     "GITHUB_TOKEN"
     "GITHUB_TOKEN.txt"
     "AMO_API_KEY"
@@ -406,23 +642,96 @@ ensure_webext_ignore() {
     "AMO_API_SECRET.txt"
     "create_and_push_repo.sh"
     "create_firefox-amo_push_github.sh"
+    "install-addon-policy.sh"
     "README.md"
     "updates.json"
-    "screenshots/"
+    "screenshots"
+    ".env"
+    "*.env"
+    ".env.*"
+    "*.sh" 
   )
 
-  if [[ ! -f "$ignore_file" ]]; then
-    printf "%s\n" "${entries[@]}" >"$ignore_file"
-    return
-  fi
+  # Ensure file exists
+  touch "$ignore_file"
 
+  # Append missing entries
   for entry in "${entries[@]}"; do
-    if ! grep -Fxq "$entry" "$ignore_file"; then
+    if ! grep -Fq "$entry" "$ignore_file"; then
        printf "%s\n" "$entry" >>"$ignore_file"
     fi
   done
 }
 
+fix_manifest_errors() {
+  local manifest_file=$1
+  local folder_name
+  folder_name=$(basename "$PWD")
+
+  echo "Running auto-fixer on $manifest_file..." >&2
+
+  python3 - "$manifest_file" "$folder_name" <<'PY'
+import sys, json, os
+
+manifest_path = sys.argv[1]
+folder_name = sys.argv[2]
+
+try:
+    with open(manifest_path, 'r', encoding="utf-8") as f:
+        data = json.load(f)
+    
+    changed = False
+
+    # 1. Ensure browser_specific_settings.gecko.id exists
+    if "browser_specific_settings" not in data:
+        data["browser_specific_settings"] = {}
+        changed = True
+    
+    if "gecko" not in data["browser_specific_settings"]:
+        data["browser_specific_settings"]["gecko"] = {}
+        changed = True
+        
+    if "id" not in data["browser_specific_settings"]["gecko"]:
+        # Generate ID based on folder name
+        # Sanitize folder name for ID
+        sanitized = "".join(c if c.isalnum() else "-" for c in folder_name).lower()
+        generated_id = f"{sanitized}@luascfl"
+        data["browser_specific_settings"]["gecko"]["id"] = generated_id
+        changed = True
+        print(f"Auto-Fix: Added ID {generated_id}")
+
+    # 2. Fix Data Collection Permissions (required for Gecko)
+    if "data_collection_permissions" not in data["browser_specific_settings"]["gecko"]:
+         data["browser_specific_settings"]["gecko"]["data_collection_permissions"] = {
+             "required": ["none"],
+             "optional": [],
+             "has_previous_consent": False
+         }
+         changed = True
+         print("Auto-Fix: Added default data_collection_permissions")
+
+    # 3. Fix MV3 Service Worker -> Background Scripts (Firefox compat)
+    # Firefox MV3 uses "background": { "scripts": ["file.js"] } instead of "service_worker"
+    if data.get("manifest_version") == 3:
+        bg = data.get("background", {})
+        if "service_worker" in bg:
+            sw_file = bg["service_worker"]
+            del data["background"]["service_worker"]
+            data["background"]["scripts"] = [sw_file]
+            # Often useful to set type: module implies strict mode, 
+            # but usually just swapping key is enough for basic shim.
+            changed = True
+            print(f"Auto-Fix: Converted background.service_worker to background.scripts for Firefox")
+
+    if changed:
+        with open(manifest_path, 'w', encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.write('\n')
+except Exception as e:
+    print(f"Error fixing manifest: {e}", file=sys.stderr)
+    sys.exit(1)
+PY
+}
 # Repo setup -----------------------------------------------------------------
 script_relative_path() {
   local repo_dir=$1
@@ -625,7 +934,7 @@ push_recursive_one_level() {
       continue
     fi
 
-    propagate_token_to_subdir "$path"
+    propagate_credentials_to_subdir "$path"
 
     # Update the child script with the current master version from base_dir
     cp "$base_dir/create_and_push_repo.sh" "$script"
@@ -688,7 +997,7 @@ push_recursive_firefox_amo_github() {
     fi
 
     script="$path/create_and_push_repo.sh"
-    propagate_token_to_subdir "$path"
+    propagate_credentials_to_subdir "$path"
 
     # Always ensure the latest script is present
     cp "$base_dir/create_and_push_repo.sh" "$script"
