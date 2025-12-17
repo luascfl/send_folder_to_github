@@ -22,7 +22,7 @@ declare -a DEFAULT_INDEX_EXCLUDES=(
   "env.sh"
   ".gemini"
 )
-declare -a SENSITIVE_PATHS=("GITHUB_TOKEN" "GITHUB_TOKEN.txt" "AMO_API_KEY.txt" "AMO_API_SECRET.txt" "gcp-oauth.keys.json")
+declare -a SENSITIVE_PATHS=("GITHUB_TOKEN" "GITHUB_TOKEN.txt" "AMO_API_KEY.txt" "AMO_API_SECRET.txt" "gcp-oauth.keys.json" "AMO_API_KEY" "AMO_API_SECRET")
 SUBCONTAINER_STATE_FILE=".subcontainers"
 SUBCONTAINER_MODE=false
 ROOT_REMOTE_URL=""
@@ -58,6 +58,11 @@ main() {
   ensure_token
   ensure_git_lfs
 
+  if [[ "$action" == "push-codex-prompts-agentsmd" ]]; then
+    push_codex_prompts_agentsmd
+    return
+  fi
+
   init_git_repo
   current_branch=$(ensure_main_branch)
   remote_url=$(resolve_remote_url "$repo_name")
@@ -89,8 +94,26 @@ main() {
       ensure_remote "$remote_url"
       clear_removed_subcontainers
       ;;
+    push-codex-prompts-agentsmd)
+      echo "Unexpected fallthrough for push-codex-prompts-agentsmd. This should have been handled earlier." >&2
+      exit 1
+      ;;
     push-recursive-1)
       push_recursive_one_level
+      ;;
+    push-firefox-amo-github)
+      SUBCONTAINER_MODE=false
+      ensure_amo_credentials
+      submit_extension_to_amo
+      ensure_remote_repo_exists "$repo_name" "$(repo_visibility_from_folder "$repo_name")"
+      ensure_remote "$remote_url"
+      sync_with_remote "$current_branch"
+      perform_push "$script_rel" "$current_branch" "$remote_url"
+      ensure_remote "$remote_url"
+      ;;
+    push-recursive-firefox-amo-github)
+      ensure_amo_credentials
+      push_recursive_firefox_amo_github
       ;;
     *)
       echo "Unknown action '$action'." >&2
@@ -102,7 +125,7 @@ main() {
 # Dependency / token helpers -------------------------------------------------
 ensure_dependencies() {
   local dep
-  for dep in git curl python3 git-lfs; do
+  for dep in git curl python3 git-lfs web-ext; do
     if ! command -v "$dep" >/dev/null 2>&1; then
       echo "Error: dependency '$dep' was not found in PATH." >&2
       exit 1
@@ -245,6 +268,161 @@ PY
   return 0
 }
 
+# AMO Credentials ------------------------------------------------------------
+ensure_amo_credentials() {
+  local missing=0
+
+  if ! load_secret_into_var AMO_API_KEY AMO_API_KEY AMO_API_KEY.txt; then
+    create_secret_placeholder AMO_API_KEY.txt "chave AMO API Key"
+    echo "Erro: defina AMO_API_KEY ou crie AMO_API_KEY(.txt)." >&2
+    missing=1
+  fi
+
+  if ! load_secret_into_var AMO_API_SECRET AMO_API_SECRET AMO_API_SECRET.txt; then
+    create_secret_placeholder AMO_API_SECRET.txt "chave AMO API Secret"
+    echo "Erro: defina AMO_API_SECRET ou crie AMO_API_SECRET(.txt)." >&2
+    missing=1
+  fi
+
+  if [[ $missing -ne 0 ]]; then
+    echo "Dica: gere as credenciais em https://addons.mozilla.org/developers/addon/api/key e cole a chave/segredo na primeira linha de cada arquivo." >&2
+    exit 1
+  fi
+}
+
+create_secret_placeholder() {
+  local filename=$1
+  local label=$2
+  local amo_url="https://addons.mozilla.org/developers/addon/api/key"
+
+  if [[ -e "$filename" ]]; then
+    return
+  fi
+
+  cat >"$filename" <<EOF
+
+# Cole sua $label na primeira linha deste arquivo.
+# Gere novas credenciais no Portal de Desenvolvedores do Firefox: $amo_url
+EOF
+
+  echo "Arquivo '$filename' criado." >&2
+  echo "Acesse $amo_url para gerar a sua $label e cole o valor na primeira linha de '$filename'." >&2
+}
+
+load_secret_into_var() {
+  local var_name=$1
+  shift
+
+  if [[ -n "${!var_name:-}" ]]; then
+    return 0
+  fi
+
+  local value candidate
+  for candidate in "$@"; do
+    if [[ -f "$candidate" ]]; then
+      value=$(read_first_line "$candidate") || continue
+      if [[ -n "$value" ]]; then
+        printf -v "$var_name" '%s' "$value"
+        export "$var_name"
+        return 0
+      fi
+    fi
+  done
+
+  return 1
+}
+
+read_first_line() {
+  local path=$1
+  python3 - "$path" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    text = path.read_text(encoding="utf-8")
+except Exception:
+    sys.exit(1)
+
+line = text.splitlines()[0] if text else ""
+print(line.lstrip("\ufeff"), end="")
+PY
+}
+
+# AMO Submission -------------------------------------------------------------
+submit_extension_to_amo() {
+  local channel=${AMO_CHANNEL:-listed}
+  ensure_webext_ignore
+
+  local artifacts_dir=${AMO_ARTIFACTS_DIR:-.web-ext-artifacts}
+  mkdir -p "$artifacts_dir"
+
+  local metadata_file=${AMO_METADATA_FILE:-amo-metadata.json}
+  if [[ ! -f "$metadata_file" ]]; then
+    cat >"$metadata_file" <<'EOF'
+{
+  "version": {
+    "custom_license": {
+      "name": {
+        "en-US": "Mozilla Public License 2.0"
+      },
+      "text": {
+        "en-US": "Mozilla Public License 2.0. Full text: https://www.mozilla.org/MPL/2.0/"
+      }
+    }
+  }
+}
+EOF
+  fi
+
+  local cmd=(web-ext sign
+    --api-key "$AMO_API_KEY"
+    --api-secret "$AMO_API_SECRET"
+    --channel "$channel"
+    --artifacts-dir "$artifacts_dir"
+    --amo-metadata "$metadata_file"
+  )
+
+  if [[ -n "${AMO_SOURCE_DIR:-}" ]]; then
+    cmd+=(--source-dir "$AMO_SOURCE_DIR")
+  fi
+
+  echo "Enviando extensão ao Firefox AMO (canal: $channel)..." >&2
+  "${cmd[@]}"
+  echo "Submissão ao AMO concluída." >&2
+}
+
+ensure_webext_ignore() {
+  local ignore_file=".web-extignore"
+  local entries=(
+    ".git/"
+    ".github/"
+    ".web-ext-artifacts/"
+    "GITHUB_TOKEN"
+    "GITHUB_TOKEN.txt"
+    "AMO_API_KEY"
+    "AMO_API_KEY.txt"
+    "AMO_API_SECRET"
+    "AMO_API_SECRET.txt"
+    "create_and_push_repo.sh"
+    "create_firefox-amo_push_github.sh"
+    "README.md"
+    "updates.json"
+    "screenshots/"
+  )
+
+  if [[ ! -f "$ignore_file" ]]; then
+    printf "%s\n" "${entries[@]}" >"$ignore_file"
+    return
+  fi
+
+  for entry in "${entries[@]}"; do
+    if ! grep -Fxq "$entry" "$ignore_file"; then
+       printf "%s\n" "$entry" >>"$ignore_file"
+    fi
+  done
+}
+
 # Repo setup -----------------------------------------------------------------
 script_relative_path() {
   local repo_dir=$1
@@ -266,7 +444,7 @@ PY
 prompt_repo_action() {
   local repo_name=$1 choice
   while true; do
-    if ! read -rp "Choose action for repository '$repo_name' [push/pull/push-subfolders/push-recursive-1/reauth] (default: push): " choice; then
+    if ! read -rp "Choose action for repository '$repo_name' [push/pull/push-subfolders/push-recursive-1/push-firefox-amo-github/push-recursive-firefox-amo-github/push-codex-prompts-agentsmd/reauth] (default: push): " choice; then
       choice=""
     fi
     case "${choice,,}" in
@@ -278,6 +456,18 @@ prompt_repo_action() {
       ;;
       push-recursive-1|push_recursive_1|pushrecursive1)
         echo "push-recursive-1"
+        return
+        ;;
+      push-firefox-amo-github|push_firefox_amo_github)
+        echo "push-firefox-amo-github"
+        return
+        ;;
+      push-recursive-firefox-amo-github|push_recursive_firefox_amo_github)
+        echo "push-recursive-firefox-amo-github"
+        return
+        ;;
+      push-codex-prompts-agentsmd|push_codex_prompts_agentsmd|push-codex|push_codex)
+        echo "push-codex-prompts-agentsmd"
         return
         ;;
       reauth|auth|token)
@@ -462,6 +652,72 @@ push_recursive_one_level() {
     printf '    (none)\n' >&2
   fi
   printf '  ignored:\n' >&2
+  if [[ ${#ignored[@]} -gt 0 ]]; then
+    local entry
+    for entry in "${ignored[@]}"; do
+      printf '    - %s\n' "$entry" >&2
+    done
+  else
+    printf '    (none)\n' >&2
+  fi
+}
+
+push_recursive_firefox_amo_github() {
+  local base_dir
+  local -a pushed=()
+  local -a ignored=()
+  local path subdir script found_xpi
+
+  base_dir=$(pwd)
+  while IFS= read -r -d '' path; do
+    subdir=${path#"$base_dir"/}
+    [[ -z "$subdir" ]] && continue
+    if [[ "${subdir:0:1}" == "." ]]; then
+      continue
+    fi
+    
+    if [[ "$subdir" == codex* ]]; then
+      ignored+=("$subdir (codex*)")
+      continue
+    fi
+
+    found_xpi=$(find "$path" -maxdepth 1 -name "*.xpi" -print -quit)
+    if [[ -z "$found_xpi" ]]; then
+      # Skip if no .xpi found
+      continue
+    fi
+
+    script="$path/create_and_push_repo.sh"
+    propagate_token_to_subdir "$path"
+
+    # Always ensure the latest script is present
+    cp "$base_dir/create_and_push_repo.sh" "$script"
+    chmod +x "$script" >/dev/null 2>&1 || true
+
+    echo "==> push-recursive-firefox-amo-github: processing '$subdir'..." >&2
+    if (
+      cd "$path" && \
+      export AMO_API_KEY="$AMO_API_KEY" && \
+      export AMO_API_SECRET="$AMO_API_SECRET" && \
+      ./create_and_push_repo.sh push-firefox-amo-github < /dev/null
+    ); then
+      pushed+=("$subdir")
+    else
+      ignored+=("$subdir (failed)")
+    fi
+  done < <(find "$base_dir" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+
+  printf '\npush-recursive-firefox-amo-github summary:\n' >&2
+  printf '  processed:\n' >&2
+  if [[ ${#pushed[@]} -gt 0 ]]; then
+    local entry
+    for entry in "${pushed[@]}"; do
+      printf '    - %s\n' "$entry" >&2
+    done
+  else
+    printf '    (none)\n' >&2
+  fi
+  printf '  failures/ignored:\n' >&2
   if [[ ${#ignored[@]} -gt 0 ]]; then
     local entry
     for entry in "${ignored[@]}"; do
@@ -1052,6 +1308,74 @@ commit_changes() {
   fi
   git commit -m "push"
   return 0
+}
+
+
+push_codex_prompts_agentsmd() {
+  local target_repo_dir=${CODEX_REPO_DIR:-/home/lucas/Downloads/codex_luascfl}
+  local repo_name="codex_luascfl"
+  local home_codex="$HOME/.codex"
+  local target_codex="$target_repo_dir/.codex"
+  local home_prompts="$home_codex/prompts"
+  local target_prompts="$target_codex/prompts"
+
+  if [[ ! -d "$target_repo_dir" ]]; then
+    echo "Target Codex repo not found: $target_repo_dir" >&2
+    exit 1
+  fi
+
+  mkdir -p "$target_prompts"
+
+  local -a rsync_opts=(-av)
+  if [[ "${RSYNC_DELETE:-1}" != "0" ]]; then
+    rsync_opts+=(--delete)
+  fi
+
+  if [[ -d "$home_prompts" ]]; then
+    rsync "${rsync_opts[@]}" "$home_prompts/" "$target_prompts/"
+  else
+    echo "Warning: no prompts found in $home_prompts; skipping prompts sync." >&2
+  fi
+
+  local file
+  for file in AGENTS.md AGENTS.override.md; do
+    if [[ -f "$home_codex/$file" ]]; then
+      cp "$home_codex/$file" "$target_codex/$file"
+    elif [[ "${RSYNC_DELETE:-1}" != "0" ]]; then
+      rm -f "$target_codex/$file"
+    fi
+  done
+
+  (
+    cd "$target_repo_dir"
+    init_git_repo
+    local branch remote_url
+    branch=$(ensure_main_branch)
+    remote_url=$(resolve_remote_url "$repo_name")
+    ensure_remote_repo_exists "$repo_name" "$(repo_visibility_from_folder "$repo_name")"
+    if git -C . remote get-url origin >/dev/null 2>&1; then
+      local current
+      current=$(git -C . remote get-url origin)
+      if [[ "$current" != "$remote_url" ]]; then
+        git -C . remote set-url origin "$remote_url"
+      fi
+    else
+      git -C . remote add origin "$remote_url"
+    fi
+
+    if git -C . ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+      pull_with_credentials "$branch" || true
+    fi
+
+    git add .codex
+    if git diff --staged --quiet; then
+      echo "No changes to commit for Codex prompts/agents." >&2
+    else
+      git commit -m "Sync Codex prompts and agents"
+    fi
+
+    push_with_credentials "$branch"
+  )
 }
 
 # Credentials helpers --------------------------------------------------------
