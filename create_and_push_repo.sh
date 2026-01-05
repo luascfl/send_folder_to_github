@@ -8,6 +8,7 @@ declare -a __SUBCONTAINERS_TO_PUSH=()
 declare -a __SUBCONTAINERS_TO_CLEAR=()
 declare -A __SUBCONTAINER_COMMITS=()
 ROOT_TOKEN_FILE=""
+ALLOW_PULL=${ALLOW_PULL:-0} # Default is fetch-only; set to 1 to allow automatic pulls/rebases
 declare -a DEFAULT_INDEX_EXCLUDES=(
   "node_modules"
   ".eslintcache"
@@ -21,6 +22,8 @@ declare -a DEFAULT_INDEX_EXCLUDES=(
   "go/"
   "env.sh"
   ".gemini"
+  "venv"
+  "logs"
 )
 declare -a SENSITIVE_PATHS=("GITHUB_TOKEN" "GITHUB_TOKEN.txt" "AMO_API_KEY.txt" "AMO_API_SECRET.txt" "gcp-oauth.keys.json" "AMO_API_KEY" "AMO_API_SECRET" ".env" "*.env" ".env.*")
 SUBCONTAINER_STATE_FILE=".subcontainers"
@@ -73,7 +76,7 @@ main() {
     pull)
       SUBCONTAINER_MODE=false
       ensure_remote "$remote_url"
-      sync_with_remote "$current_branch"
+      sync_with_remote "$current_branch" 1
       echo "Pull completed successfully from: $remote_url"
       ;;
     push)
@@ -91,6 +94,17 @@ main() {
       ensure_remote "$remote_url"
       sync_with_remote "$current_branch"
       ensure_subcontainers_ready
+      perform_push "$script_rel" "$current_branch" "$remote_url"
+      ensure_remote "$remote_url"
+      clear_removed_subcontainers
+      ;;
+    push-subfolders-releases)
+      SUBCONTAINER_MODE=true
+      prepare_subcontainer_plan "$repo_name"
+      ensure_remote_repo_exists "$repo_name" "$(repo_visibility_from_folder "$repo_name")"
+      ensure_remote "$remote_url"
+      sync_with_remote "$current_branch"
+      ensure_subcontainers_ready_with_releases
       perform_push "$script_rel" "$current_branch" "$remote_url"
       ensure_remote "$remote_url"
       clear_removed_subcontainers
@@ -117,6 +131,9 @@ main() {
     push-recursive-firefox-amo-github)
       ensure_amo_credentials
       push_recursive_firefox_amo_github
+      ;;
+    push-codex-subfolders-recursive-all)
+      push_codex_subfolders_recursive
       ;;
     *)
       echo "Unknown action '$action'." >&2
@@ -753,7 +770,7 @@ PY
 prompt_repo_action() {
   local repo_name=$1 choice
   while true; do
-    if ! read -rp "Choose action for repository '$repo_name' [push/pull/push-subfolders/push-recursive-1/push-firefox-amo-github/push-recursive-firefox-amo-github/push-codex-prompts-agentsmd/reauth] (default: push): " choice; then
+    if ! read -rp "Choose action for repository '$repo_name' [push/pull/push-subfolders/push-subfolders-releases/push-recursive-1/push-firefox-amo-github/push-recursive-firefox-amo-github/push-codex-prompts-agentsmd/push-codex-subfolders-recursive-all/reauth] (default: push): " choice; then
       choice=""
     fi
     case "${choice,,}" in
@@ -761,6 +778,10 @@ prompt_repo_action() {
       pull) echo "pull"; return ;;
       push-subfolders|push+subfolders|push_subfolders)
         echo "push-subfolders"
+        return
+      ;;
+      push-subfolders-releases|push_subfolders_releases)
+        echo "push-subfolders-releases"
         return
       ;;
       push-recursive-1|push_recursive_1|pushrecursive1)
@@ -777,6 +798,10 @@ prompt_repo_action() {
         ;;
       push-codex-prompts-agentsmd|push_codex_prompts_agentsmd|push-codex|push_codex)
         echo "push-codex-prompts-agentsmd"
+        return
+        ;;
+      push-codex-subfolders-recursive-all|push_codex_subfolders_all|codex-recursive-all)
+        echo "push-codex-subfolders-recursive-all"
         return
         ;;
       reauth|auth|token)
@@ -872,14 +897,48 @@ restore_root_remote() {
 
 # Sync -----------------------------------------------------------------------
 sync_with_remote() {
-  local branch=$1
+  local branch=$1 allow_pull=${2:-$ALLOW_PULL}
   if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
-    echo "Remote branch '$branch' found. Syncing (pull --rebase)..." >&2
-    if pull_with_credentials "$branch"; then
-      echo "Sync completed." >&2
-    else
-      echo "Warning: pull could not be completed automatically." >&2
+    echo "Remote branch '$branch' found. Fetching (no pull by default)..." >&2
+    if ! git fetch --prune --no-tags origin "$branch"; then
+      echo "Warning: fetch failed; skipping sync." >&2
+      return 1
     fi
+
+    local local_rev remote_rev base
+    local_rev=$(git rev-parse HEAD)
+    remote_rev=$(git rev-parse "origin/$branch")
+    base=$(git merge-base HEAD "origin/$branch" 2>/dev/null || true)
+
+    if [[ "$local_rev" == "$remote_rev" ]]; then
+      echo "Already in sync with origin/$branch." >&2
+      return 0
+    fi
+
+    if [[ "$local_rev" == "$base" ]]; then
+      echo "Local is behind origin/$branch. Pull required." >&2
+      if [[ "$allow_pull" == "1" ]]; then
+        pull_with_credentials "$branch" && return 0
+        echo "Pull failed; please resolve manually." >&2
+        return 1
+      fi
+      echo "Skipping pull to protect local work. Set ALLOW_PULL=1 or run the 'pull' action to enable." >&2
+      exit 1
+    fi
+
+    if [[ "$remote_rev" == "$base" ]]; then
+      echo "Local is ahead of origin/$branch; proceeding without pull." >&2
+      return 0
+    fi
+
+    echo "Local and origin/$branch have diverged. Pull/rebase required." >&2
+    if [[ "$allow_pull" == "1" ]]; then
+      pull_with_credentials "$branch" && return 0
+      echo "Pull failed; please resolve manually." >&2
+      return 1
+    fi
+    echo "Skipping pull to protect local work. Set ALLOW_PULL=1 or run the 'pull' action to enable." >&2
+    exit 1
   else
     echo "Remote branch '$branch' not found. Assuming first push/pull." >&2
   fi
@@ -1037,6 +1096,60 @@ push_recursive_firefox_amo_github() {
   fi
 }
 
+push_codex_subfolders_recursive() {
+  local base_dir
+  local -a pushed=()
+  local -a failed=()
+  local path subdir script
+
+  base_dir=$(pwd)
+  echo "==> Starting recursive push-subfolders for 'codex*' directories..." >&2
+
+  while IFS= read -r -d '' path; do
+    subdir=${path#"$base_dir"/}
+    [[ -z "$subdir" ]] && continue
+    
+    script="$path/create_and_push_repo.sh"
+
+    # Propagate credentials
+    propagate_credentials_to_subdir "$path"
+
+    # Update the child script with the current master version from base_dir
+    cp "$base_dir/create_and_push_repo.sh" "$script"
+    chmod +x "$script" >/dev/null 2>&1 || true
+
+    echo "==> Processing Codex Folder: '$subdir'..." >&2
+    if (
+      cd "$path" && \
+      ./create_and_push_repo.sh push-subfolders < /dev/null
+    ); then
+      pushed+=("$subdir")
+    else
+      failed+=("$subdir")
+    fi
+  done < <(find "$base_dir" -mindepth 1 -maxdepth 1 -type d -name "codex*" -print0 2>/dev/null)
+
+  printf '\npush-codex-subfolders-recursive-all summary:\n' >&2
+  printf '  processed:\n' >&2
+  if [[ ${#pushed[@]} -gt 0 ]]; then
+    local entry
+    for entry in "${pushed[@]}"; do
+      printf '    - %s\n' "$entry" >&2
+    done
+  else
+    printf '    (none)\n' >&2
+  fi
+  printf '  failures:\n' >&2
+  if [[ ${#failed[@]} -gt 0 ]]; then
+    local entry
+    for entry in "${failed[@]}"; do
+      printf '    - %s\n' "$entry" >&2
+    done
+  else
+    printf '    (none)\n' >&2
+  fi
+}
+
 prepare_subcontainer_plan() {
   local root_repo_name=$1
   __SUBCONTAINERS_TO_PUSH=()
@@ -1057,6 +1170,8 @@ prepare_subcontainer_plan() {
     path=${path#./}
     [[ "$path" == ".git" ]] && continue
     [[ "$path" == .* ]] && continue
+    [[ "$path" == "venv" ]] && continue
+    [[ "$path" == "logs" ]] && continue
     subdirs+=("$path")
   done < <(find . -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null || true)
 
@@ -1094,6 +1209,104 @@ ensure_subcontainers_ready() {
     IFS="|" read -r subdir repo visibility <<<"$entry"
     ensure_single_subcontainer_ready "$subdir" "$repo" "$visibility"
   done
+}
+
+ensure_subcontainers_ready_with_releases() {
+  if [[ ${#__SUBCONTAINERS_TO_PUSH[@]} -eq 0 ]]; then
+    echo "No subfolders detected to manage as submodules." >&2
+    return
+  fi
+
+  local entry subdir repo visibility
+  for entry in "${__SUBCONTAINERS_TO_PUSH[@]}"; do
+    IFS="|" read -r subdir repo visibility <<<"$entry"
+    ensure_single_subcontainer_ready "$subdir" "$repo" "$visibility"
+    create_release_for_subdir "$subdir" "$repo"
+  done
+}
+
+create_release_for_subdir() {
+  local subdir=$1 repo_name=$2
+  
+  # Find APK file
+  local apk_file
+  apk_file=$(find "$subdir" -maxdepth 1 -name "*.apk" -print -quit)
+  
+  if [[ -z "$apk_file" ]]; then
+    echo "No APK found in $subdir, skipping release creation." >&2
+    return
+  fi
+  
+  local filename
+  filename=$(basename "$apk_file")
+  
+  # Extract version from filename (e.g., AppName_v1.2.3.apk -> v1.2.3)
+  local version
+  if [[ "$filename" =~ v([0-9]+\.[0-9]+(\.[0-9]+)?) ]]; then
+    version="v${BASH_REMATCH[1]}"
+  else
+    # Fallback to timestamp if no version found
+    version="release-$(date +%Y%m%d-%H%M%S)"
+  fi
+  
+  echo "Creating release $version for $repo_name..." >&2
+  
+  # Create tag
+  git -C "$subdir" tag -a "$version" -m "Release $version" 2>/dev/null || true
+  
+  # Push tag
+  if [[ "${GITHUB_REMOTE_PROTOCOL:-https}" == "https" ]]; then
+    run_with_https_credentials git -C "$subdir" push origin "$version" >/dev/null 2>&1 || true
+  else
+    git -C "$subdir" push origin "$version" >/dev/null 2>&1 || true
+  fi
+  
+  # Create Release via API using Python
+  python3 - "$repo_name" "$version" "$apk_file" "$GITHUB_TOKEN" <<'PY'
+import sys, requests, os
+
+repo, tag, apk_path, token = sys.argv[1:]
+filename = os.path.basename(apk_path)
+headers = {'Authorization': f'token {token}', 'Accept': 'application/vnd.github.v3+json'}
+
+# 1. Get or Create Release
+url = f'https://api.github.com/repos/luascfl/{repo}/releases/tags/{tag}'
+r = requests.get(url, headers=headers)
+
+if r.status_code == 404:
+    print(f"Creating new release for {tag}...")
+    url_create = f'https://api.github.com/repos/luascfl/{repo}/releases'
+    data = {'tag_name': tag, 'name': f'Release {tag}', 'body': 'Automated release', 'draft': False, 'prerelease': False}
+    r = requests.post(url_create, headers=headers, json=data)
+    if r.status_code != 201:
+        print(f"Error creating release: {r.text}")
+        sys.exit(1)
+    release = r.json()
+else:
+    print(f"Release {tag} already exists.")
+    release = r.json()
+
+# 2. Upload Asset
+upload_url = release['upload_url'].replace('{?name,label}', '')
+
+if os.path.exists(apk_path):
+    print(f"Uploading {filename}...")
+    with open(apk_path, 'rb') as f:
+        data = f.read()
+    
+    headers_upload = headers.copy()
+    headers_upload['Content-Type'] = 'application/vnd.android.package-archive'
+    
+    r_up = requests.post(f'{upload_url}?name={filename}', headers=headers_upload, data=data)
+    if r_up.status_code == 201:
+        print(f"Success! Download link: {r_up.json().get('browser_download_url')}")
+    elif r_up.status_code == 422:
+        print("Asset already exists.")
+    else:
+        print(f"Upload failed: {r_up.text}")
+else:
+    print(f"File not found: {apk_path}")
+PY
 }
 
 ensure_single_subcontainer_ready() {
@@ -1177,6 +1390,13 @@ commit_and_push_submodule() {
     commit_submodule_safely "$subdir"
   fi
   ensure_submodule_initial_commit "$subdir"
+
+  # Sync before push to avoid non-fast-forward errors
+  if git -C "$subdir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+      # Only pull if remote is configured
+      run_git_pull_command_submodule "$subdir" "main" >/dev/null 2>&1 || true
+  fi
+
   push_submodule_with_credentials "$subdir"
 }
 
@@ -1201,6 +1421,18 @@ ensure_submodule_initial_commit() {
   git -C "$subdir" commit --allow-empty -m "Initial subcontainer commit" >/dev/null
 }
 
+run_git_pull_command_submodule() {
+  local subdir=$1 branch=$2 output status
+  if [[ "${GITHUB_REMOTE_PROTOCOL:-https}" == "https" ]]; then
+    output=$(run_with_https_credentials git -C "$subdir" pull --rebase origin "$branch" 2>&1)
+  else
+    output=$(git -C "$subdir" pull --rebase origin "$branch" 2>&1)
+  fi
+  status=$?
+  printf "%s\n" "$output"
+  return $status
+}
+
 record_subcontainer_commit() {
   local subdir=$1 commit
   commit=$(git -C "$subdir" rev-parse HEAD 2>/dev/null || true)
@@ -1213,20 +1445,39 @@ record_subcontainer_commit() {
 
 push_submodule_with_credentials() {
   local subdir=$1 branch=${2:-main} output status
+  
+  # Define push command execution
+  local -a push_cmd=(git -C "$subdir" push -u origin "$branch")
+
   if [[ "${GITHUB_REMOTE_PROTOCOL:-https}" == "https" ]]; then
-    if output=$(run_with_https_credentials git -C "$subdir" push -u origin "$branch" 2>&1); then
-      status=0
-    else
-      status=$?
-    fi
+    output=$(run_with_https_credentials "${push_cmd[@]}" 2>&1)
   else
-    if output=$(git -C "$subdir" push -u origin "$branch" 2>&1); then
-      status=0
-    else
-      status=$?
-    fi
+    output=$("${push_cmd[@]}" 2>&1)
   fi
+  status=$?
+  
   printf "%s\n" "$output"
+  
+  # Handle non-fast-forward (fetch first)
+  if [[ $status -ne 0 ]] && [[ "$output" == *"fetch first"* || "$output" == *"non-fast-forward"* ]]; then
+     echo "Submodule push rejected (non-fast-forward)." >&2
+     if [[ "${ALLOW_PULL:-0}" == "1" ]]; then
+       echo "ALLOW_PULL=1: attempting pull --rebase for '$subdir' then retrying push..." >&2
+       if run_git_pull_command_submodule "$subdir" "$branch"; then
+          echo "Pull successful. Retrying push..." >&2
+          if [[ "${GITHUB_REMOTE_PROTOCOL:-https}" == "https" ]]; then
+              output=$(run_with_https_credentials "${push_cmd[@]}" 2>&1)
+          else
+              output=$("${push_cmd[@]}" 2>&1)
+          fi
+          status=$?
+          printf "%s\n" "$output"
+       fi
+     else
+       echo "Skipping automatic pull for submodule (ALLOW_PULL=0). Please pull/rebase manually or rerun with ALLOW_PULL=1." >&2
+     fi
+  fi
+
   if [[ $status -ne 0 ]]; then
     if handle_large_file_push_rejection "$subdir" "$output"; then
       echo "Retrying submodule push for '$subdir' after enabling Git LFS..." >&2
@@ -1731,9 +1982,15 @@ push_with_credentials() {
   fi
   printf "%s\n" "$output"
   if [[ $status -ne 0 && "$output" =~ non-fast-forward ]]; then
-    echo "Push rejected (non-fast-forward). Trying automatic pull before retrying..." >&2
-    if pull_with_credentials "$branch" && push_with_credentials "$branch"; then
-      return 0
+    echo "Push rejected (non-fast-forward)." >&2
+    if [[ "${ALLOW_PULL:-0}" == "1" ]]; then
+      echo "ALLOW_PULL=1: attempting pull --rebase then retrying push..." >&2
+      if pull_with_credentials "$branch" && push_with_credentials "$branch"; then
+        return 0
+      fi
+    else
+      echo "Skipping automatic pull (ALLOW_PULL=0). Please pull/rebase manually or rerun with ALLOW_PULL=1." >&2
+      return $status
     fi
   fi
   if [[ $status -ne 0 ]]; then
@@ -1751,34 +2008,20 @@ pull_with_credentials() {
   local branch=$1 output
   if output=$(run_git_pull_command "$branch"); then
     printf "%s\n" "$output"
-    __restore_all_backups
     return 0
   fi
 
-  if is_untracked_overwrite_error "$output"; then
-    if resolve_untracked_overwrite_conflicts "$branch" "$output"; then
-      __restore_all_backups
-      return 0
-    fi
-  fi
-
-  if rebase_in_progress && auto_resolve_rebase_conflicts "$branch"; then
-    __restore_all_backups
-    return 0
-  fi
-
-  __restore_all_backups
   printf "%s\n" "$output" >&2
-  echo "Warning: 'pull --rebase' failed. There may be conflicts that require manual intervention." >&2
+  echo "Warning: 'pull --rebase' failed. Working tree left untouched; resolve conflicts/stash/clean manually." >&2
   return 1
 }
 
 run_git_pull_command() {
   local branch=$1 output status
   if [[ "${GITHUB_REMOTE_PROTOCOL:-https}" == "https" ]]; then
-    output=$(run_with_https_credentials git pull --rebase --autostash origin "$branch" 2>&1)
+    output=$(run_with_https_credentials git pull --rebase origin "$branch" 2>&1)
   else
-    output=$(git pull --rebase --autostash origin "$branch" 2>&1)
+    output=$(git pull --rebase origin "$branch" 2>&1)
   fi
   status=$?
   printf "%s" "$output"
