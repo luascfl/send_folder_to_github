@@ -20,6 +20,7 @@ declare -a DEFAULT_INDEX_EXCLUDES=(
   "whatsapp-mcp/whatsapp-bridge/store/whatsapp.db"
   "whatsapp-mcp/whatsapp-bridge/store/messages.db"
   "gcp-oauth.keys.json"
+  "gemini-gcloud-key.json"
   "meus_arquivos_mcp"
   "go/"
   "env.sh"
@@ -27,7 +28,7 @@ declare -a DEFAULT_INDEX_EXCLUDES=(
   "venv"
   "logs"
 )
-declare -a SENSITIVE_PATHS=("GITHUB_TOKEN" "GITHUB_TOKEN.txt" "AMO_API_KEY.txt" "AMO_API_SECRET.txt" "gcp-oauth.keys.json" "AMO_API_KEY" "AMO_API_SECRET" ".env" "*.env" ".env.*")
+declare -a SENSITIVE_PATHS=("GITHUB_TOKEN" "GITHUB_TOKEN.txt" "AMO_API_KEY.txt" "AMO_API_SECRET.txt" "gcp-oauth.keys.json" "gemini-gcloud-key.json" "AMO_API_KEY" "AMO_API_SECRET" ".env" "*.env" ".env.*")
 SUBCONTAINER_STATE_FILE=".subcontainers"
 SUBCONTAINER_MODE=false
 ROOT_REMOTE_URL=""
@@ -64,23 +65,12 @@ main() {
   ensure_token
   ensure_git_lfs
 
-  if [[ "$action" == "push-codex-prompts-agentsmd" ]]; then
-    push_codex_prompts_agentsmd
-    return
-  fi
-
   init_git_repo
   current_branch=$(ensure_main_branch)
   remote_url=$(resolve_remote_url "$repo_name")
   ROOT_REMOTE_URL="$remote_url"
 
   case "$action" in
-    pull)
-      SUBCONTAINER_MODE=false
-      ensure_remote "$remote_url"
-      sync_with_remote "$current_branch" 1
-      echo "Pull completed successfully from: $remote_url"
-      ;;
     push)
       SUBCONTAINER_MODE=false
       ensure_remote_repo_exists "$repo_name" "$(repo_visibility_from_folder "$repo_name")"
@@ -88,7 +78,7 @@ main() {
       sync_with_remote "$current_branch"
       perform_push "$script_rel" "$current_branch" "$remote_url"
       ensure_remote "$remote_url"
-      ;;
+      ;; 
     push-subfolders)
       SUBCONTAINER_MODE=true
       prepare_subcontainer_plan "$repo_name"
@@ -99,7 +89,7 @@ main() {
       perform_push "$script_rel" "$current_branch" "$remote_url"
       ensure_remote "$remote_url"
       clear_removed_subcontainers
-      ;;
+      ;; 
     push-subfolders-releases)
       SUBCONTAINER_MODE=true
       prepare_subcontainer_plan "$repo_name"
@@ -110,14 +100,10 @@ main() {
       perform_push "$script_rel" "$current_branch" "$remote_url"
       ensure_remote "$remote_url"
       clear_removed_subcontainers
-      ;;
-    push-codex-prompts-agentsmd)
-      echo "Unexpected fallthrough for push-codex-prompts-agentsmd. This should have been handled earlier." >&2
-      exit 1
-      ;;
-    push-recursive-1)
-      push_recursive_one_level
-      ;;
+      ;; 
+    push-recursive)
+      push_recursive_all
+      ;; 
     push-firefox-amo-github)
       SUBCONTAINER_MODE=false
       ensure_amo_credentials
@@ -129,18 +115,11 @@ main() {
       sync_with_remote "$current_branch"
       perform_push "$script_rel" "$current_branch" "$remote_url"
       ensure_remote "$remote_url"
-      ;;
-    push-recursive-firefox-amo-github)
-      ensure_amo_credentials
-      push_recursive_firefox_amo_github
-      ;;
-    push-codex-subfolders-recursive-all)
-      push_codex_subfolders_recursive
-      ;;
+      ;; 
     *)
       echo "Unknown action '$action'." >&2
       exit 1
-      ;;
+      ;; 
   esac
 }
 
@@ -657,9 +636,10 @@ ensure_webext_ignore() {
     "GITHUB_TOKEN.txt"
     "AMO_API_KEY"
     "AMO_API_KEY.txt"
-    "AMO_API_SECRET"
-    "AMO_API_SECRET.txt"
-    "create_and_push_repo.sh"
+    "AMO_API_SECRET",
+    "AMO_API_SECRET.txt",
+    "gemini-gcloud-key.json",
+    "create_and_push_repo.sh",
     "create_firefox-amo_push_github.sh"
     "install-addon-policy.sh"
     "README.md"
@@ -772,12 +752,11 @@ PY
 prompt_repo_action() {
   local repo_name=$1 choice
   while true; do
-    if ! read -rp "Choose action for repository '$repo_name' [push/pull/push-subfolders/push-subfolders-releases/push-recursive-1/push-firefox-amo-github/push-recursive-firefox-amo-github/push-codex-prompts-agentsmd/push-codex-subfolders-recursive-all/reauth] (default: push): " choice; then
+    if ! read -rp "Choose action for repository '$repo_name' [push/push-recursive/reauth] (default: push): " choice; then
       choice=""
     fi
     case "${choice,,}" in
       ""|push) echo "push"; return ;;
-      pull) echo "pull"; return ;;
       push-subfolders|push+subfolders|push_subfolders)
         echo "push-subfolders"
         return
@@ -786,31 +765,19 @@ prompt_repo_action() {
         echo "push-subfolders-releases"
         return
       ;;
-      push-recursive-1|push_recursive_1|pushrecursive1)
-        echo "push-recursive-1"
+      push-recursive|push_recursive|recursive)
+        echo "push-recursive"
         return
-        ;;
-      push-firefox-amo-github|push_firefox_amo_github)
+        ;;      push-firefox-amo-github|push_firefox_amo_github)
+        # Keep hidden but functional if typed manually
         echo "push-firefox-amo-github"
-        return
-        ;;
-      push-recursive-firefox-amo-github|push_recursive_firefox_amo_github)
-        echo "push-recursive-firefox-amo-github"
-        return
-        ;;
-      push-codex-prompts-agentsmd|push_codex_prompts_agentsmd|push-codex|push_codex)
-        echo "push-codex-prompts-agentsmd"
-        return
-        ;;
-      push-codex-subfolders-recursive-all|push_codex_subfolders_all|codex-recursive-all)
-        echo "push-codex-subfolders-recursive-all"
         return
         ;;
       reauth|auth|token)
         echo "reauth"
         return
         ;;
-      *) echo "Invalid input. Type 'push', 'pull', 'push-subfolders', 'push-recursive-1', or 'reauth'." >&2 ;;
+      *) echo "Invalid input. Type 'push', 'push-subfolders-releases', 'push-recursive', or 'reauth'." >&2 ;; 
     esac
   done
 }
@@ -837,8 +804,8 @@ ensure_main_branch() {
 resolve_remote_url() {
   local repo_name=$1
   case "${GITHUB_REMOTE_PROTOCOL:-https}" in
-    ssh) echo "git@github.com:luascfl/$repo_name.git" ;;
-    https|*) echo "https://github.com/luascfl/$repo_name.git" ;;
+    ssh) echo "git@github.com:luascfl/$repo_name.git" ;; 
+    https|*) echo "https://github.com/luascfl/$repo_name.git" ;; 
   esac
 }
 
@@ -854,8 +821,8 @@ repo_visibility_from_folder() {
 ensure_remote_repo_exists() {
   local repo_name=$1 visibility=${2:-public} private_flag
   case "$visibility" in
-    private|true|1) private_flag=true ;;
-    *) private_flag=false ;;
+    private|true|1) private_flag=true ;; 
+    *) private_flag=false ;; 
   esac
   local response http_status
   response=$(mktemp)
@@ -866,12 +833,12 @@ ensure_remote_repo_exists() {
     -d "{\"name\":\"$repo_name\",\"private\":$private_flag}")
 
   case "$http_status" in
-    201) ;;
-    422) echo "Warning: repository '$repo_name' already exists in luascfl. Continuing." >&2 ;;
+    201) ;; 
+    422) echo "Warning: repository '$repo_name' already exists in luascfl. Continuing." >&2 ;; 
     *) echo "Error creating repository (status $http_status):" >&2
        cat "$response" >&2
        rm -f "$response"
-       exit 1 ;;
+       exit 1 ;; 
   esac
   rm -f "$response"
 }
@@ -964,189 +931,76 @@ perform_push() {
   fi
 }
 
-push_recursive_one_level() {
-  local base_dir
-  local -a pushed=()
-  local -a ignored=()
-  local path subdir script blocker
-
-  base_dir=$(pwd)
-  while IFS= read -r -d '' path; do
-    subdir=${path#"$base_dir"/}
-    [[ -z "$subdir" ]] && continue
-    if [[ "${subdir:0:1}" == "." ]]; then
-      continue
-    fi
-    
-    if [[ "$subdir" == codex* ]]; then
-      ignored+=("$subdir (codex*)")
-      continue
-    fi
-    
-    blocker="$path/create_firefox-amo_push_github.sh"
-    if [[ -f "$blocker" ]]; then
-      ignored+=("$subdir (blocking create_firefox-amo_push_github.sh)")
-      continue
-    fi
-
-    script="$path/create_and_push_repo.sh"
-    if [[ ! -f "$script" ]]; then
-      # Silent skip for unrelated folders
-      continue
-    fi
-
-    propagate_credentials_to_subdir "$path"
-
-    # Update the child script with the current master version from base_dir
-    cp "$base_dir/create_and_push_repo.sh" "$script"
-    chmod +x "$script" >/dev/null 2>&1 || true
-
-    echo "==> push-recursive-1: pushing '$subdir' (script updated)..." >&2
-    if (
-      cd "$path" && \
-      ./create_and_push_repo.sh push < /dev/null
-    ); then
-      pushed+=("$subdir")
-    else
-      ignored+=("$subdir (push failed)")
-    fi
-  done < <(find "$base_dir" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
-
-  printf '\npush-recursive-1 summary:\n' >&2  printf '  pushed:\n' >&2
-  if [[ ${#pushed[@]} -gt 0 ]]; then
-    local entry
-    for entry in "${pushed[@]}"; do
-      printf '    - %s\n' "$entry" >&2
-    done
-  else
-    printf '    (none)\n' >&2
-  fi
-  printf '  ignored:\n' >&2
-  if [[ ${#ignored[@]} -gt 0 ]]; then
-    local entry
-    for entry in "${ignored[@]}"; do
-      printf '    - %s\n' "$entry" >&2
-    done
-  else
-    printf '    (none)\n' >&2
-  fi
-}
-
-push_recursive_firefox_amo_github() {
-  local base_dir
-  local -a pushed=()
-  local -a ignored=()
-  local path subdir script found_xpi
-
-  base_dir=$(pwd)
-  while IFS= read -r -d '' path; do
-    subdir=${path#"$base_dir"/}
-    [[ -z "$subdir" ]] && continue
-    if [[ "${subdir:0:1}" == "." ]]; then
-      continue
-    fi
-    
-    if [[ "$subdir" == codex* ]]; then
-      ignored+=("$subdir (codex*)")
-      continue
-    fi
-
-    found_xpi=$(find "$path" -maxdepth 1 -name "*.xpi" -print -quit)
-    if [[ -z "$found_xpi" ]]; then
-      # Skip if no .xpi found
-      continue
-    fi
-
-    script="$path/create_and_push_repo.sh"
-    propagate_credentials_to_subdir "$path"
-
-    # Always ensure the latest script is present
-    cp "$base_dir/create_and_push_repo.sh" "$script"
-    chmod +x "$script" >/dev/null 2>&1 || true
-
-    echo "==> push-recursive-firefox-amo-github: processing '$subdir'..." >&2
-    if (
-      cd "$path" && \
-      export AMO_API_KEY="$AMO_API_KEY" && \
-      export AMO_API_SECRET="$AMO_API_SECRET" && \
-      ./create_and_push_repo.sh push-firefox-amo-github < /dev/null
-    ); then
-      pushed+=("$subdir")
-    else
-      ignored+=("$subdir (failed)")
-    fi
-  done < <(find "$base_dir" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
-
-  printf '\npush-recursive-firefox-amo-github summary:\n' >&2
-  printf '  processed:\n' >&2
-  if [[ ${#pushed[@]} -gt 0 ]]; then
-    local entry
-    for entry in "${pushed[@]}"; do
-      printf '    - %s\n' "$entry" >&2
-    done
-  else
-    printf '    (none)\n' >&2
-  fi
-  printf '  failures/ignored:\n' >&2
-  if [[ ${#ignored[@]} -gt 0 ]]; then
-    local entry
-    for entry in "${ignored[@]}"; do
-      printf '    - %s\n' "$entry" >&2
-    done
-  else
-    printf '    (none)\n' >&2
-  fi
-}
-
-push_codex_subfolders_recursive() {
+push_recursive_all() {
   local base_dir
   local -a pushed=()
   local -a failed=()
-  local path subdir script
+  local -a ignored=()
+  local path subdir script action found_xpi
 
   base_dir=$(pwd)
-  echo "==> Starting recursive push-subfolders for 'codex*' directories..." >&2
+  echo "==> Starting recursive push for all known types..." >&2
 
   while IFS= read -r -d '' path; do
     subdir=${path#"$base_dir"/}
     [[ -z "$subdir" ]] && continue
+    if [[ "${subdir:0:1}" == "." ]]; then
+      continue
+    fi
+    
+    # 1. Determine type/action
+    action=""
+    
+    if [[ "$subdir" == releases* ]]; then
+        action="push-subfolders-releases"
+    elif [[ "$subdir" == codex* ]]; then
+        action="push-subfolders"
+    elif [[ -n $(find "$path" -maxdepth 1 -name "*.xpi" -print -quit) ]]; then
+        action="push-firefox-amo-github"
+    elif [[ -f "$path/create_and_push_repo.sh" ]]; then
+        action="push"
+    else
+        ignored+=("$subdir (not a managed repo)")
+        continue
+    fi
     
     script="$path/create_and_push_repo.sh"
-
-    # Propagate credentials
+    
     propagate_credentials_to_subdir "$path"
-
-    # Update the child script with the current master version from base_dir
+    
+    # Update/Install script
     cp "$base_dir/create_and_push_repo.sh" "$script"
     chmod +x "$script" >/dev/null 2>&1 || true
 
-    echo "==> Processing Codex Folder: '$subdir'..." >&2
+    echo "==> Recursive processing: '$subdir' (Action: $action)..." >&2
     if (
       cd "$path" && \
-      ./create_and_push_repo.sh push-subfolders < /dev/null
+      export AMO_API_KEY="${AMO_API_KEY:-}" && \
+      export AMO_API_SECRET="${AMO_API_SECRET:-}" && \
+      ./create_and_push_repo.sh "$action" < /dev/null
     ); then
-      pushed+=("$subdir")
+      pushed+=("$subdir ($action)")
     else
-      failed+=("$subdir")
+      failed+=("$subdir ($action)")
     fi
-  done < <(find "$base_dir" -mindepth 1 -maxdepth 1 -type d -name "codex*" -print0 2>/dev/null)
+  done < <(find "$base_dir" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
 
-  printf '\npush-codex-subfolders-recursive-all summary:\n' >&2
+  printf '\npush-recursive-all summary:\n' >&2
   printf '  processed:\n' >&2
   if [[ ${#pushed[@]} -gt 0 ]]; then
-    local entry
-    for entry in "${pushed[@]}"; do
-      printf '    - %s\n' "$entry" >&2
-    done
+    for entry in "${pushed[@]}"; do printf '    - %s\n' "$entry" >&2; done
   else
     printf '    (none)\n' >&2
   fi
   printf '  failures:\n' >&2
   if [[ ${#failed[@]} -gt 0 ]]; then
-    local entry
-    for entry in "${failed[@]}"; do
-      printf '    - %s\n' "$entry" >&2
-    done
+    for entry in "${failed[@]}"; do printf '    - %s\n' "$entry" >&2; done
+  else
+    printf '    (none)\n' >&2
+  fi
+  printf '  ignored:\n' >&2
+  if [[ ${#ignored[@]} -gt 0 ]]; then
+    for entry in "${ignored[@]}"; do printf '    - %s\n' "$entry" >&2; done
   else
     printf '    (none)\n' >&2
   fi
@@ -1251,7 +1105,7 @@ create_release_for_subdir() {
     version="release-$(date +%Y%m%d-%H%M%S)"
   fi
   
-  echo "Creating release $version for $repo_name..." >&2
+  echo "Verifying release $version for $repo_name..." >&2
   
   # Create tag
   git -C "$subdir" tag -a "$version" -m "Release $version" 2>/dev/null || true
@@ -1285,13 +1139,16 @@ if r.status_code == 404:
         sys.exit(1)
     release = r.json()
 else:
-    print(f"Release {tag} already exists.")
+    # Release exists, silently proceed
     release = r.json()
 
 # 2. Upload Asset
 upload_url = release['upload_url'].replace('{?name,label}', '')
+existing_assets = [a['name'] for a in release.get('assets', [])]
 
-if os.path.exists(apk_path):
+if filename in existing_assets:
+    print(f"Asset {filename} already present.")
+elif os.path.exists(apk_path):
     print(f"Uploading {filename}...")
     with open(apk_path, 'rb') as f:
         data = f.read()
@@ -1303,7 +1160,7 @@ if os.path.exists(apk_path):
     if r_up.status_code == 201:
         print(f"Success! Download link: {r_up.json().get('browser_download_url')}")
     elif r_up.status_code == 422:
-        print("Asset already exists.")
+        print("Asset already uploaded.")
     else:
         print(f"Upload failed: {r_up.text}")
 else:
@@ -1387,7 +1244,7 @@ commit_and_push_submodule() {
   stage_submodule_changes "$subdir"
   ensure_lfs_for_large_files "$subdir"
   if git -C "$subdir" diff --staged --quiet; then
-    :
+    : 
   else
     commit_submodule_safely "$subdir"
   fi
@@ -1776,7 +1633,7 @@ ensure_lfs_for_large_files() {
       continue
     fi
     attr=$(git -C "$repo_path" check-attr filter -- "$path" 2>/dev/null || true)
-    if [[ "$attr" == *"filter: lfs" ]]; then
+    if [[ "$attr" == *"filter: lfs"* ]]; then
       continue
     fi
     to_track+=("$path")
@@ -1825,10 +1682,11 @@ ensure_token_gitignore() {
     "__pycache__/"
     ".gemini"
     "GITHUB_TOKEN"
-    "GITHUB_TOKEN.txt"
-    "AMO_API_KEY.txt"
-    "AMO_API_SECRET.txt"
-    "*API*"
+    "GITHUB_TOKEN.txt",
+    "AMO_API_KEY.txt",
+    "AMO_API_SECRET.txt",
+    "gemini-gcloud-key.json",
+    "*API*",
     ".eslintcache/"
     "node_modules/"
     "dist/"
@@ -1870,74 +1728,6 @@ commit_changes() {
   fi
   git commit -m "push"
   return 0
-}
-
-
-push_codex_prompts_agentsmd() {
-  local target_repo_dir=${CODEX_REPO_DIR:-/home/lucas/Downloads/codex_luascfl}
-  local repo_name="codex_luascfl"
-  local home_codex="$HOME/.codex"
-  local target_codex="$target_repo_dir/.codex"
-  local home_prompts="$home_codex/prompts"
-  local target_prompts="$target_codex/prompts"
-
-  if [[ ! -d "$target_repo_dir" ]]; then
-    echo "Target Codex repo not found: $target_repo_dir" >&2
-    exit 1
-  fi
-
-  mkdir -p "$target_prompts"
-
-  local -a rsync_opts=(-av)
-  if [[ "${RSYNC_DELETE:-1}" != "0" ]]; then
-    rsync_opts+=(--delete)
-  fi
-
-  if [[ -d "$home_prompts" ]]; then
-    rsync "${rsync_opts[@]}" "$home_prompts/" "$target_prompts/"
-  else
-    echo "Warning: no prompts found in $home_prompts; skipping prompts sync." >&2
-  fi
-
-  local file
-  for file in AGENTS.md AGENTS.override.md; do
-    if [[ -f "$home_codex/$file" ]]; then
-      cp "$home_codex/$file" "$target_codex/$file"
-    elif [[ "${RSYNC_DELETE:-1}" != "0" ]]; then
-      rm -f "$target_codex/$file"
-    fi
-  done
-
-  (
-    cd "$target_repo_dir"
-    init_git_repo
-    local branch remote_url
-    branch=$(ensure_main_branch)
-    remote_url=$(resolve_remote_url "$repo_name")
-    ensure_remote_repo_exists "$repo_name" "$(repo_visibility_from_folder "$repo_name")"
-    if git -C . remote get-url origin >/dev/null 2>&1; then
-      local current
-      current=$(git -C . remote get-url origin)
-      if [[ "$current" != "$remote_url" ]]; then
-        git -C . remote set-url origin "$remote_url"
-      fi
-    else
-      git -C . remote add origin "$remote_url"
-    fi
-
-    if git -C . ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
-      pull_with_credentials "$branch" || true
-    fi
-
-    git add .codex
-    if git diff --staged --quiet; then
-      echo "No changes to commit for Codex prompts/agents." >&2
-    else
-      git commit -m "Sync Codex prompts and agents"
-    fi
-
-    push_with_credentials "$branch"
-  )
 }
 
 # Credentials helpers --------------------------------------------------------
