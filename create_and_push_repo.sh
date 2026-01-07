@@ -13,6 +13,8 @@ declare -a DEFAULT_INDEX_EXCLUDES=(
   "node_modules"
   ".eslintcache"
   "__pycache__"
+  "pycache"
+  "cache"
   "dist"
   "build"
   "whatsapp-mcp/whatsapp-bridge/store/whatsapp.db"
