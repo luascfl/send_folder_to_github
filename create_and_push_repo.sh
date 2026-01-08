@@ -791,19 +791,19 @@ PY
 
 prompt_repo_action() {
   local repo_name=$1 choice
-  echo "----------------------------------------------------------------"
-  echo "Create and Push Repo Script"
-  echo "----------------------------------------------------------------"
-  echo "This script manages git repositories, handling authentication,"
-  echo "remote creation, and recursive operations for subfolders."
-  echo ""
-  echo "Available Actions:"
-  echo "  push            : Pushes the current directory as a single repo."
-  echo "  push-recursive  : Scans subfolders and pushes them individually,"
-  echo "                    detecting special types (Codex, Firefox Ext,"
-  echo "                    Releases) automatically."
-  echo "  reauth          : Updates GitHub/AMO credentials."
-  echo "----------------------------------------------------------------"
+  echo "----------------------------------------------------------------" >&2
+  echo "Create and Push Repo Script" >&2
+  echo "----------------------------------------------------------------" >&2
+  echo "This script manages git repositories, handling authentication," >&2
+  echo "remote creation, and recursive operations for subfolders." >&2
+  echo "" >&2
+  echo "Available Actions:" >&2
+  echo "  push            : Pushes the current directory as a single repo." >&2
+  echo "  push-recursive  : Scans subfolders and pushes them individually," >&2
+  echo "                    detecting special types (Codex, Firefox Ext," >&2
+  echo "                    Releases) automatically." >&2
+  echo "  reauth          : Updates GitHub/AMO credentials." >&2
+  echo "----------------------------------------------------------------" >&2
   
   while true; do
     if ! read -rp "Choose action for repository '$repo_name' [push/push-recursive/reauth] (default: push): " choice; then
@@ -822,7 +822,8 @@ prompt_repo_action() {
       push-recursive|push_recursive|recursive)
         echo "push-recursive"
         return
-        ;;      push-firefox-amo-github|push_firefox_amo_github)
+        ;;
+      push-firefox-amo-github|push_firefox_amo_github)
         # Keep hidden but functional if typed manually
         echo "push-firefox-amo-github"
         return
@@ -831,7 +832,7 @@ prompt_repo_action() {
         echo "reauth"
         return
         ;;
-      *) echo "Invalid input. Type 'push', 'push-subfolders-releases', 'push-recursive', or 'reauth'." >&2 ;; 
+      *) echo "Invalid input. Type 'push', 'push-recursive', or 'reauth'." >&2 ;; 
     esac
   done
 }
@@ -1423,6 +1424,11 @@ push_submodule_with_credentials() {
   fi
 
   if [[ $status -ne 0 ]]; then
+    if handle_push_secrets_rejection "$subdir" "$output"; then
+      echo "Retrying submodule push after removing secrets..." >&2
+      push_submodule_with_credentials "$subdir" "$branch"
+      return $?
+    fi
     if handle_large_file_push_rejection "$subdir" "$output"; then
       echo "Retrying submodule push for '$subdir' after enabling Git LFS..." >&2
       push_submodule_with_credentials "$subdir" "$branch"
@@ -1506,6 +1512,80 @@ print("\n".join(found))
 PY
 }
 
+handle_push_secrets_rejection() {
+  local repo_path=$1 push_output=$2
+  if [[ "$push_output" != *"GH013"* ]] && [[ "$push_output" != *"Push cannot contain secrets"* ]]; then
+    return 1
+  fi
+  
+  echo "Security violation detected! Attempting automatic fix..." >&2
+  
+  # Extract file paths using Python
+  local files
+  files=$(python3 - "$push_output" <<'PY'
+import sys, re
+text = sys.argv[1]
+found = []
+# Look for "path: filename:line"
+patterns = [r'path:\s*([^:\n]+)(:\d+)?']
+for line in text.splitlines():
+    for pat in patterns:
+        m = re.search(pat, line)
+        if m:
+            path = m.group(1).strip()
+            if path and path not in found:
+                found.append(path)
+print("\n".join(found))
+PY
+)
+
+  if [[ -z "$files" ]]; then
+    echo "Could not parse secret file paths from error message." >&2
+    return 1
+  fi
+
+  local secrets_found_in_head=0
+  while IFS= read -r file; do
+    [[ -z "$file" ]] && continue
+    
+    # Check if file exists in HEAD
+    if git -C "$repo_path" ls-tree -r HEAD --name-only | grep -Fqx "$file"; then
+       echo "Removing secret file from commit (HEAD): $file" >&2
+       secrets_found_in_head=1
+       
+       # Remove from index
+       git -C "$repo_path" rm --cached --ignore-unmatch "$file" >/dev/null 2>&1
+       
+       # Add to .gitignore if not present
+       if [[ -f "$repo_path/.gitignore" ]]; then
+          if ! grep -Fq "$file" "$repo_path/.gitignore"; then
+             echo "$file" >> "$repo_path/.gitignore"
+             git -C "$repo_path" add .gitignore
+          fi
+       else
+          echo "$file" > "$repo_path/.gitignore"
+          git -C "$repo_path" add .gitignore
+       fi
+    else
+       echo "Warning: Secret file '$file' not found in HEAD. It might be in deep history." >&2
+    fi
+  done <<< "$files"
+  
+  if [[ $secrets_found_in_head -eq 0 ]]; then
+     echo "Secrets detected are not in the latest commit. Manual history cleanup required (e.g. git filter-repo)." >&2
+     return 1
+  fi
+  
+  # Amend the last commit
+  if git -C "$repo_path" commit --amend --no-edit >/dev/null 2>&1; then
+     echo "Commit amended (secrets removed). Retrying push..." >&2
+     return 0
+  else
+     echo "Failed to amend commit." >&2
+     return 1
+  fi
+}
+
 register_submodule_reference() {
   local subdir=$1 remote_url=$2
   git config -f .gitmodules "submodule.$subdir.path" "$subdir"
@@ -1520,6 +1600,7 @@ remove_submodule_config() {
   local subdir=$1
   git config -f .gitmodules --remove-section "submodule.$subdir" >/dev/null 2>&1 || true
   git config --remove-section "submodule.$subdir" >/dev/null 2>&1 || true
+  git rm --cached --ignore-unmatch "$subdir" >/dev/null 2>&1 || true
   if [[ -d ".git/modules/$subdir" ]]; then
     rm -rf ".git/modules/$subdir"
   fi
@@ -1966,6 +2047,11 @@ push_with_credentials() {
     fi
   fi
   if [[ $status -ne 0 ]]; then
+    if handle_push_secrets_rejection "." "$output"; then
+      echo "Retrying push after removing secrets..." >&2
+      push_with_credentials "$branch"
+      return $?
+    fi
     if handle_large_file_push_rejection "." "$output"; then
       echo "Retrying push after enabling Git LFS for large files..." >&2
       push_with_credentials "$branch"
