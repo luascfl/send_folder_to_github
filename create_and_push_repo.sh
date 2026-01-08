@@ -1064,6 +1064,17 @@ prepare_subcontainer_plan() {
     [[ "$path" == .* ]] && continue
     [[ "$path" == "venv" ]] && continue
     [[ "$path" == "logs" ]] && continue
+    
+    # Skip excluded items from DEFAULT_INDEX_EXCLUDES
+    local excluded=false
+    for skip in "${DEFAULT_INDEX_EXCLUDES[@]}"; do
+      if [[ "$path" == "$skip" ]]; then
+        excluded=true
+        break
+      fi
+    done
+    [[ "$excluded" == "true" ]] && continue
+
     subdirs+=("$path")
   done < <(find . -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null || true)
 
