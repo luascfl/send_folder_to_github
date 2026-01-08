@@ -1389,10 +1389,13 @@ record_subcontainer_commit() {
 }
 
 push_submodule_with_credentials() {
-  local subdir=$1 branch=${2:-main} output status
+  local subdir=$1 branch=${2:-main} force_flag=${3:-} output status
   
   # Define push command execution
   local -a push_cmd=(git -C "$subdir" push -u origin "$branch")
+  if [[ -n "$force_flag" ]]; then
+    push_cmd+=("$force_flag")
+  fi
 
   if [[ "${GITHUB_REMOTE_PROTOCOL:-https}" == "https" ]]; then
     output=$(run_with_https_credentials "${push_cmd[@]}" 2>&1)
@@ -1405,6 +1408,12 @@ push_submodule_with_credentials() {
   
   # Handle non-fast-forward (fetch first)
   if [[ $status -ne 0 ]] && [[ "$output" == *"fetch first"* || "$output" == *"non-fast-forward"* ]]; then
+     # If we are forcing, we expect non-fast-forward, so we shouldn't fail/pull here if it was intentional
+     if [[ -n "$force_flag" ]]; then
+         echo "Force push failed even with --force." >&2
+         return $status
+     fi
+     
      echo "Submodule push rejected (non-fast-forward)." >&2
      if [[ "${ALLOW_PULL:-0}" == "1" ]]; then
        echo "ALLOW_PULL=1: attempting pull --rebase for '$subdir' then retrying push..." >&2
@@ -1424,11 +1433,19 @@ push_submodule_with_credentials() {
   fi
 
   if [[ $status -ne 0 ]]; then
-    if handle_push_secrets_rejection "$subdir" "$output"; then
+    handle_push_secrets_rejection "$subdir" "$output"
+    local secret_status=$?
+    
+    if [[ $secret_status -eq 0 ]]; then
       echo "Retrying submodule push after removing secrets..." >&2
       push_submodule_with_credentials "$subdir" "$branch"
       return $?
+    elif [[ $secret_status -eq 2 ]]; then
+      echo "Deep history cleaned. Retrying submodule push with --force..." >&2
+      push_submodule_with_credentials "$subdir" "$branch" "--force"
+      return $?
     fi
+
     if handle_large_file_push_rejection "$subdir" "$output"; then
       echo "Retrying submodule push for '$subdir' after enabling Git LFS..." >&2
       push_submodule_with_credentials "$subdir" "$branch"
@@ -1545,6 +1562,7 @@ PY
   fi
 
   local secrets_found_in_head=0
+  local file
   while IFS= read -r file; do
     [[ -z "$file" ]] && continue
     
@@ -1566,23 +1584,65 @@ PY
           echo "$file" > "$repo_path/.gitignore"
           git -C "$repo_path" add .gitignore
        fi
-    else
-       echo "Warning: Secret file '$file' not found in HEAD. It might be in deep history." >&2
     fi
   done <<< "$files"
   
-  if [[ $secrets_found_in_head -eq 0 ]]; then
-     echo "Secrets detected are not in the latest commit. Manual history cleanup required (e.g. git filter-repo)." >&2
-     return 1
-  fi
-  
-  # Amend the last commit
-  if git -C "$repo_path" commit --amend --no-edit >/dev/null 2>&1; then
-     echo "Commit amended (secrets removed). Retrying push..." >&2
-     return 0
+  if [[ $secrets_found_in_head -eq 1 ]]; then
+      # Amend the last commit (Standard Fix)
+      if git -C "$repo_path" commit --amend --no-edit >/dev/null 2>&1; then
+         echo "Commit amended (secrets removed from HEAD). Retrying push..." >&2
+         return 0
+      else
+         echo "Failed to amend commit." >&2
+         return 1
+      fi
   else
-     echo "Failed to amend commit." >&2
-     return 1
+      # Advanced Fix: Deep History Cleanup
+      echo "Secrets detected in deep history (not in HEAD). Initiating advanced cleanup..." >&2
+      local git_rm_args=""
+      local file_count=0
+      
+      while IFS= read -r file; do
+          [[ -z "$file" ]] && continue
+          git_rm_args="$git_rm_args '$file'"
+          
+          # Add to .gitignore if not present
+          if ! grep -Fq "$file" "$repo_path/.gitignore" 2>/dev/null; then
+               [[ -s "$repo_path/.gitignore" && "$(tail -c 1 "$repo_path/.gitignore" | wc -l)" -eq 0 ]] && echo "" >> "$repo_path/.gitignore"
+               echo "$file" >> "$repo_path/.gitignore"
+          fi
+          ((file_count++))
+      done <<< "$files"
+
+      if [[ $file_count -eq 0 ]]; then
+         echo "No files identified for deep cleanup." >&2
+         return 1
+      fi
+
+      echo "Rewriting history to remove: $git_rm_args" >&2
+      echo "Warning: This operation rewrites commit history (git filter-branch)." >&2
+
+      if git -C "$repo_path" filter-branch --force --index-filter \
+         "git rm --cached --ignore-unmatch $git_rm_args" \
+         --prune-empty --tag-name-filter cat -- --all >/dev/null 2>&1; then
+
+         # Cleanup backup refs
+         rm -rf "$repo_path/.git/refs/original/"
+         git -C "$repo_path" reflog expire --expire=now --all
+         git -C "$repo_path" gc --prune=now >/dev/null 2>&1
+
+         # Ensure .gitignore changes are committed
+         if [[ -n $(git -C "$repo_path" status --porcelain .gitignore) ]]; then
+             git -C "$repo_path" add .gitignore
+             git -C "$repo_path" commit -m "chore: ignore sensitive keys (post-cleanup)" >/dev/null 2>&1 || true
+         fi
+
+         echo "History rewritten. Force push required." >&2
+         return 2 # Signal FORCE PUSH
+      else
+         echo "Failed to rewrite history with filter-branch." >&2
+         return 1
+      fi
   fi
 }
 
@@ -2019,15 +2079,21 @@ run_git_with_credentials() {
 }
 
 push_with_credentials() {
-  local branch=$1 output status
+  local branch=$1 force_flag=${2:-} output status
+  
+  local -a push_cmd=(git push -u origin "$branch")
+  if [[ -n "$force_flag" ]]; then
+    push_cmd+=("$force_flag")
+  fi
+
   if [[ "${GITHUB_REMOTE_PROTOCOL:-https}" == "https" ]]; then
-    if output=$(run_with_https_credentials git push -u origin "$branch" 2>&1); then
+    if output=$(run_with_https_credentials "${push_cmd[@]}" 2>&1); then
       status=0
     else
       status=$?
     fi
   else
-    if output=$(git push -u origin "$branch" 2>&1); then
+    if output=$("${push_cmd[@]}" 2>&1); then
       status=0
     else
       status=$?
@@ -2035,6 +2101,10 @@ push_with_credentials() {
   fi
   printf "%s\n" "$output"
   if [[ $status -ne 0 && "$output" =~ non-fast-forward ]]; then
+    if [[ -n "$force_flag" ]]; then
+        echo "Force push failed even with --force." >&2
+        return $status
+    fi
     echo "Push rejected (non-fast-forward)." >&2
     if [[ "${ALLOW_PULL:-0}" == "1" ]]; then
       echo "ALLOW_PULL=1: attempting pull --rebase then retrying push..." >&2
@@ -2047,11 +2117,19 @@ push_with_credentials() {
     fi
   fi
   if [[ $status -ne 0 ]]; then
-    if handle_push_secrets_rejection "." "$output"; then
+    handle_push_secrets_rejection "." "$output"
+    local secret_status=$?
+    
+    if [[ $secret_status -eq 0 ]]; then
       echo "Retrying push after removing secrets..." >&2
       push_with_credentials "$branch"
       return $?
+    elif [[ $secret_status -eq 2 ]]; then
+      echo "Deep history cleaned. Retrying push with --force..." >&2
+      push_with_credentials "$branch" "--force"
+      return $?
     fi
+
     if handle_large_file_push_rejection "." "$output"; then
       echo "Retrying push after enabling Git LFS for large files..." >&2
       push_with_credentials "$branch"
