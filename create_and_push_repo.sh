@@ -1837,6 +1837,12 @@ auto_ignore_problematic_files() {
 
     # 2. Handle Sensitive Files (fixes 'Repository rule violations... secrets' error)
     local -a sensitive_patterns=(
+        "GITHUB_TOKEN"
+        "GITHUB_TOKEN.txt"
+        "AMO_API_KEY"
+        "AMO_API_KEY.txt"
+        "AMO_API_SECRET"
+        "AMO_API_SECRET.txt"
         "*key.json"
         "*credential*.json"
         "client_secret*.json"
