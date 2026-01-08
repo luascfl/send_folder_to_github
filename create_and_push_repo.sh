@@ -104,6 +104,9 @@ main() {
     push-recursive)
       push_recursive_all
       ;; 
+    sync-scripts)
+      sync_scripts_recursively
+      ;;
     push-firefox-amo-github)
       SUBCONTAINER_MODE=false
       ensure_amo_credentials
@@ -586,6 +589,12 @@ except:
 PY
 )
           if [[ -n "$wait_seconds" ]]; then
+              local max_allowed_wait=300
+              if (( wait_seconds > max_allowed_wait )); then
+                  echo "Aviso: O tempo de espera do AMO ($wait_seconds s) excede o limite de ${max_allowed_wait}s. Pulando submissão..." >&2
+                  final_status=1
+                  break
+              fi
               local sleep_time=$((wait_seconds + 5))
               echo "Throttling detectado. O AMO pediu para esperar $wait_seconds segundos." >&2
               echo "Aguardando $sleep_time segundos antes de tentar novamente..." >&2
@@ -751,6 +760,20 @@ PY
 
 prompt_repo_action() {
   local repo_name=$1 choice
+  echo "----------------------------------------------------------------"
+  echo "Create and Push Repo Script"
+  echo "----------------------------------------------------------------"
+  echo "This script manages git repositories, handling authentication,"
+  echo "remote creation, and recursive operations for subfolders."
+  echo ""
+  echo "Available Actions:"
+  echo "  push            : Pushes the current directory as a single repo."
+  echo "  push-recursive  : Scans subfolders and pushes them individually,"
+  echo "                    detecting special types (Codex, Firefox Ext,"
+  echo "                    Releases) automatically."
+  echo "  reauth          : Updates GitHub/AMO credentials."
+  echo "----------------------------------------------------------------"
+  
   while true; do
     if ! read -rp "Choose action for repository '$repo_name' [push/push-recursive/reauth] (default: push): " choice; then
       choice=""
@@ -824,6 +847,18 @@ ensure_remote_repo_exists() {
     private|true|1) private_flag=true ;; 
     *) private_flag=false ;; 
   esac
+
+  # OPTIMIZATION: Check if repo exists to avoid Rate Limit on Creation (POST)
+  local check_status
+  check_status=$(curl -s -o /dev/null -w "%{http_code}" \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    "https://api.github.com/repos/luascfl/$repo_name")
+  
+  if [[ "$check_status" == "200" ]]; then
+     # Repository exists, skip creation
+     return
+  fi
+
   local response http_status
   response=$(mktemp)
   http_status=$(curl -sS -w "%{http_code}" -o "$response" \
@@ -983,6 +1018,7 @@ push_recursive_all() {
     else
       failed+=("$subdir ($action)")
     fi
+    sleep 2 # Prevent rate-limiting
   done < <(find "$base_dir" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
 
   printf '\npush-recursive-all summary:\n' >&2
@@ -1224,6 +1260,13 @@ stage_submodule_changes() {
     cd "$subdir" || return
     ensure_token_gitignore
     cleanup_local_backup_artifacts
+    
+    # --- NEW: Auto-ignore problematic files for submodules ---
+    # We call the function from the parent script context, but we are inside the subdir subshell
+    # so we pass "." as the path.
+    auto_ignore_problematic_files "."
+    # ---------------------------------------------------------
+
     remove_paths_from_index "${DEFAULT_INDEX_EXCLUDES[@]}"
     git add --all
     remove_paths_from_index "${DEFAULT_INDEX_EXCLUDES[@]}"
@@ -1563,6 +1606,11 @@ stage_files_excluding_script() {
   ensure_token_gitignore
   cleanup_local_backup_artifacts
   ensure_submodules_populated
+  
+  # --- NEW: Auto-ignore problematic files before adding ---
+  auto_ignore_problematic_files "."
+  # --------------------------------------------------------
+
   remove_paths_from_index "${DEFAULT_INDEX_EXCLUDES[@]}"
   git add --all
   remove_paths_from_index "${DEFAULT_INDEX_EXCLUDES[@]}"
@@ -1580,6 +1628,87 @@ stage_files_excluding_script() {
   protect_path "AMO_API_KEY.txt"
   protect_path "AMO_API_SECRET.txt"
 }
+
+# --- NEW FUNCTION: Auto-detect and ignore sensitive/problematic files ---
+auto_ignore_problematic_files() {
+  local repo_path=$1
+  (
+    cd "$repo_path" || return
+    local changed=0
+    
+    # 1. Handle GitHub Workflows (fixes 'refusing to allow... workflow scope' error)
+    if [[ -d ".github/workflows" ]]; then
+       if ! grep -q "^\.github/workflows/" .gitignore 2>/dev/null; then
+           [[ -s .gitignore && "$(tail -c 1 .gitignore | wc -l)" -eq 0 ]] && echo "" >> .gitignore
+           echo ".github/workflows/" >> .gitignore
+           echo "   [Auto-Fix] Ignored .github/workflows/ to prevent permission errors." >&2
+           changed=1
+       fi
+       # Remove from index if present
+       git rm -r --cached --ignore-unmatch .github/workflows/ >/dev/null 2>&1 || true
+    fi
+
+    # 2. Handle Sensitive Files (fixes 'Repository rule violations... secrets' error)
+    local -a sensitive_patterns=(
+        "*key.json"
+        "*credential*.json"
+        "client_secret*.json"
+        "*.pem"
+        "*.p12"
+        "id_rsa"
+        "id_dsa"
+        "*.keystore"
+        "*.jks"
+    )
+
+    local pattern found_files
+    for pattern in "${sensitive_patterns[@]}"; do
+        # Find files matching pattern (exclude .git)
+        found_files=$(find . -maxdepth 4 -name "$pattern" -not -path "./.git/*" 2>/dev/null)
+        
+        if [[ -n "$found_files" ]]; then
+            # Check if pattern is already in gitignore
+            if ! grep -Fq "$pattern" .gitignore 2>/dev/null; then
+                [[ -s .gitignore && "$(tail -c 1 .gitignore | wc -l)" -eq 0 ]] && echo "" >> .gitignore
+                echo "$pattern" >> .gitignore
+                echo "   [Auto-Fix] Ignored sensitive pattern '$pattern' found in repo." >&2
+                changed=1
+            fi
+            
+            # Remove specific files from index
+            for file in $found_files; do
+                git rm --cached --ignore-unmatch "$file" >/dev/null 2>&1 || true
+            done
+        fi
+    done
+    
+    # 3. Handle System Junk & Default Excludes
+    local -a all_excludes=("${DEFAULT_INDEX_EXCLUDES[@]}")
+    # Add common junk that might not be in the global list
+    all_excludes+=("__pycache__" ".DS_Store" "Thumbs.db")
+
+    for item in "${all_excludes[@]}"; do
+         # Remove trailing slashes for directory check
+         local clean_item=${item%/}
+         
+         if [[ -e "$clean_item" ]]; then
+             if ! grep -Fxq "$clean_item" .gitignore 2>/dev/null && ! grep -Fxq "$clean_item/" .gitignore 2>/dev/null; then
+                 [[ -s .gitignore && "$(tail -c 1 .gitignore | wc -l)" -eq 0 ]] && echo "" >> .gitignore
+                 # If it's a directory, add trailing slash to gitignore
+                 if [[ -d "$clean_item" ]]; then
+                    echo "$clean_item/" >> .gitignore
+                 else
+                    echo "$clean_item" >> .gitignore
+                 fi
+                 echo "   [Auto-Fix] Ignored excluded item '$clean_item'." >&2
+                 changed=1
+             fi
+             git rm -r --cached --ignore-unmatch "$clean_item" >/dev/null 2>&1 || true
+         fi
+    done
+  )
+}
+# ------------------------------------------------------------------------
 
 ensure_submodules_populated() {
   if [[ ! -f .gitmodules ]]; then
@@ -1684,12 +1813,12 @@ ensure_token_gitignore() {
     "pycache"
     ".gemini"
     "GITHUB_TOKEN"
-    "GITHUB_TOKEN.txt",
-    "AMO_API_KEY.txt",
-    "AMO_API_SECRET.txt",
-    "gemini-gcloud-key.json",
-    "gcp-oauth.keys.json",
-    "*API*",
+    "GITHUB_TOKEN.txt"
+    "AMO_API_KEY.txt"
+    "AMO_API_SECRET.txt"
+    "gemini-gcloud-key.json"
+    "gcp-oauth.keys.json"
+    "*API*"
     ".eslintcache/"
     "node_modules/"
     "dist/"
@@ -1701,11 +1830,17 @@ ensure_token_gitignore() {
     return
   fi
 
+  # Ensure the file ends with a newline before appending
+  if [[ -s "$gitignore" && "$(tail -c 1 "$gitignore" | wc -l)" -eq 0 ]]; then
+      echo "" >> "$gitignore"
+  fi
+
   local entry
   for entry in "${entries[@]}"; do
     if ! grep -Fxq "$entry" "$gitignore"; then
       printf "%s\n" "$entry" >> "$gitignore"
     fi
+  
   done
 }
 
