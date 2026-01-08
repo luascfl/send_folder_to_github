@@ -1897,6 +1897,17 @@ ensure_submodules_populated() {
   if [[ ! -f .gitmodules ]]; then
     return
   fi
+  
+  # Sanitize common ignored directories that might accidentally contain .git
+  local -a cleanup_targets=("node_modules" "__pycache__" "venv" "env" ".mypy_cache" ".pytest_cache")
+  local target
+  for target in "${cleanup_targets[@]}"; do
+      if [[ -e "$target/.git" ]]; then
+          echo "Removing invalid git metadata from ignored directory '$target'..." >&2
+          rm -rf "$target/.git"
+      fi
+  done
+
   if ! git config -f .gitmodules --get-regexp '^submodule\.' >/dev/null 2>&1; then
     return
   fi
