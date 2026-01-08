@@ -1549,10 +1549,11 @@ purge_sensitive_paths_from_index() {
   local repo_path=${1:-.}
   (
     cd "$repo_path" || return 0
-    local path
-    for path in "${SENSITIVE_PATHS[@]}"; do
-      [[ -z "$path" ]] && continue
-      git rm --cached --ignore-unmatch -- "$path" >/dev/null 2>&1 || true
+    local pattern
+    for pattern in "${SENSITIVE_PATHS[@]}"; do
+      [[ -z "$pattern" ]] && continue
+      # Use find to locate files matching the pattern recursively and remove them from index
+      find . -name "$pattern" -exec git rm --cached --ignore-unmatch -- {} + >/dev/null 2>&1 || true
     done
   )
 }
@@ -1680,12 +1681,14 @@ ensure_token_gitignore() {
     "*.env.development"
     "*.env.production"
     "__pycache__/"
+    "pycache"
     ".gemini"
     "GITHUB_TOKEN"
     "GITHUB_TOKEN.txt",
     "AMO_API_KEY.txt",
     "AMO_API_SECRET.txt",
     "gemini-gcloud-key.json",
+    "gcp-oauth.keys.json",
     "*API*",
     ".eslintcache/"
     "node_modules/"
