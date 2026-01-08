@@ -27,6 +27,8 @@ declare -a DEFAULT_INDEX_EXCLUDES=(
   ".gemini"
   "venv"
   "logs"
+  ".aider*"
+  ".cursor*"
 )
 declare -a SENSITIVE_PATHS=("GITHUB_TOKEN" "GITHUB_TOKEN.txt" "AMO_API_KEY.txt" "AMO_API_SECRET.txt" "gcp-oauth.keys.json" "gemini-gcloud-key.json" "AMO_API_KEY" "AMO_API_SECRET" ".env" "*.env" ".env.*")
 SUBCONTAINER_STATE_FILE=".subcontainers"
@@ -493,6 +495,29 @@ submit_extension_to_amo() {
   # AUTO-FIX VALIDATION ERRORS
   fix_manifest_errors "$original_manifest"
 
+  # Check version to avoid redundant submission
+  local current_version last_version
+  current_version=$(python3 -c "import json, sys; print(json.load(open('$original_manifest')).get('version', ''))" 2>/dev/null || echo "")
+  
+  if [[ -f ".amo-last-version" ]]; then
+    last_version=$(cat ".amo-last-version")
+  else
+    last_version=""
+  fi
+
+  if [[ -n "$current_version" && "$current_version" == "$last_version" ]]; then
+    echo "AMO: Version $current_version already submitted. Skipping." >&2
+    # Restore Original Manifest if swapped
+    if [[ $swapped -eq 1 ]]; then
+      if [[ -f "$backup_manifest" ]]; then
+        mv "$backup_manifest" "$original_manifest"
+      else
+        rm "$original_manifest"
+      fi
+    fi
+    return 0
+  fi
+
   local metadata_file=${AMO_METADATA_FILE:-amo-metadata.json}
   if [[ ! -f "$metadata_file" ]]; then
     cat >"$metadata_file" <<'EOF'
@@ -610,6 +635,12 @@ PY
           # Success (exit code 0 natural)
           echo "Log de sucesso (tail):" >&2
           tail -n 5 web-ext-output.log >&2
+          
+          # UPDATE LAST SUCCESSFUL VERSION
+          if [[ -n "$current_version" ]]; then
+             echo "$current_version" > ".amo-last-version"
+          fi
+          
           break
       fi
   done
