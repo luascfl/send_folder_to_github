@@ -1788,7 +1788,11 @@ stage_files_excluding_script() {
   local script_rel=$1
   ensure_token_gitignore
   cleanup_local_backup_artifacts
-  ensure_submodules_populated
+  
+  # Only populate submodules if NOT in subcontainer mode (managed manually there)
+  if [[ "${SUBCONTAINER_MODE:-false}" != "true" ]]; then
+      ensure_submodules_populated
+  fi
   
   # --- NEW: Auto-ignore problematic files before adding ---
   auto_ignore_problematic_files "."
@@ -1899,7 +1903,7 @@ ensure_submodules_populated() {
   fi
   
   # Sanitize common ignored directories that might accidentally contain .git
-  local -a cleanup_targets=("node_modules" "__pycache__" "venv" "env" ".mypy_cache" ".pytest_cache")
+  local -a cleanup_targets=("node_modules" "__pycache__" "venv" "env" ".mypy_cache" ".pytest_cache" "cache")
   local target
   for target in "${cleanup_targets[@]}"; do
       if [[ -e "$target/.git" ]]; then
