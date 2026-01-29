@@ -3,12 +3,20 @@
 set -euo pipefail
 
 # Globals -------------------------------------------------------------------
+export GIT_AUTHOR_NAME=${GIT_AUTHOR_NAME:-luascfl}
+export GIT_AUTHOR_EMAIL=${GIT_AUTHOR_EMAIL:-luascfl@example.com}
+export GIT_COMMITTER_NAME=${GIT_COMMITTER_NAME:-luascfl}
+export GIT_COMMITTER_EMAIL=${GIT_COMMITTER_EMAIL:-luascfl@example.com}
 declare -a __UNTRACKED_BACKUPS=()
 declare -a __SUBCONTAINERS_TO_PUSH=()
 declare -a __SUBCONTAINERS_TO_CLEAR=()
 declare -A __SUBCONTAINER_COMMITS=()
 ROOT_TOKEN_FILE=""
 ALLOW_PULL=${ALLOW_PULL:-0} # Default is fetch-only; set to 1 to allow automatic pulls/rebases
+AUTO_INSTALL_DEPS=${AUTO_INSTALL_DEPS:-1}
+__APT_UPDATED=0
+CUSTOM_IGNORED_REMOTE_REPOS=("cache")
+CENTRAL_CONFIG_DIR="${HOME}/Downloads"
 declare -a DEFAULT_INDEX_EXCLUDES=(
   "node_modules"
   ".eslintcache"
@@ -30,13 +38,67 @@ declare -a DEFAULT_INDEX_EXCLUDES=(
   ".aider*"
   ".cursor*"
 )
+declare -a IGNORED_REMOTE_REPOS=()
+add_ignored_remote_repo() {
+  local name=$1
+  [[ -z "$name" ]] && return
+  for existing in "${IGNORED_REMOTE_REPOS[@]}"; do
+    if [[ "$existing" == "$name" ]]; then
+      return
+    fi
+  done
+  IGNORED_REMOTE_REPOS+=("$name")
+}
+
+for name in "${CUSTOM_IGNORED_REMOTE_REPOS[@]}"; do
+  add_ignored_remote_repo "$name"
+done
+
+for entry in "${DEFAULT_INDEX_EXCLUDES[@]}"; do
+  sanitized="${entry%/}"
+  if [[ -z "$sanitized" || "$sanitized" == .* || "$sanitized" == *"/"* || "$sanitized" == *"*"* ]]; then
+    continue
+  fi
+  add_ignored_remote_repo "$sanitized"
+done
 declare -a SENSITIVE_PATHS=("GITHUB_TOKEN" "GITHUB_TOKEN.txt" "AMO_API_KEY.txt" "AMO_API_SECRET.txt" "gcp-oauth.keys.json" "gemini-gcloud-key.json" "AMO_API_KEY" "AMO_API_SECRET" ".env" "*.env" ".env.*")
 SUBCONTAINER_STATE_FILE=".subcontainers"
 SUBCONTAINER_MODE=false
 ROOT_REMOTE_URL=""
+GITHUB_API_URL="https://api.github.com"
 ROOT_REPO_NAME=""
 ROOT_REPO_DIR=""
 trap '__restore_all_backups; restore_root_remote' EXIT INT TERM
+
+# Logging --------------------------------------------------------------------
+log_info() { echo -e "\033[34m[INFO]\033[0m $*" >&2; }
+log_warn() { echo -e "\033[33m[WARN]\033[0m $*" >&2; }
+log_error() { echo -e "\033[31m[ERROR]\033[0m $*" >&2; }
+log_success() { echo -e "\033[32m[SUCCESS]\033[0m $*" >&2; }
+
+perform_subcontainer_push_sequence() {
+  local repo_name=$1 remote_url=$2 current_branch=$3 script_rel=$4 with_releases=${5:-false}
+
+  SUBCONTAINER_MODE=true
+  prepare_subcontainer_plan "$repo_name"
+  ensure_remote_repo_exists "$repo_name" "$(repo_visibility_from_folder "$repo_name")"
+  ensure_remote "$remote_url"
+  sync_with_remote "$current_branch"
+
+  if [[ "$with_releases" == "true" ]]; then
+      ensure_subcontainers_ready_with_releases
+  else
+      ensure_subcontainers_ready
+  fi
+
+  perform_push "$script_rel" "$current_branch" "$remote_url"
+  ensure_remote "$remote_url"
+  clear_removed_subcontainers
+
+  if [[ "$with_releases" == "false" ]] && should_run_global_codex_sync; then
+    run_codex_sync
+  fi
+}
 
 main() {
   local repo_dir repo_name script_rel action current_branch remote_url
@@ -67,7 +129,22 @@ main() {
   ensure_token
   ensure_git_lfs
 
+  if ! warn_index_lock; then
+    exit 1
+  fi
+
+  if ! warn_root_owned; then
+    exit 1
+  fi
+
+  if remote_should_be_ignored "$repo_name"; then
+    delete_remote_repo "$repo_name"
+    echo "Repository '$repo_name' is configured to be ignored and will not be pushed." >&2
+    return
+  fi
+
   init_git_repo
+  ensure_root_commit
   current_branch=$(ensure_main_branch)
   remote_url=$(resolve_remote_url "$repo_name")
   ROOT_REMOTE_URL="$remote_url"
@@ -82,26 +159,10 @@ main() {
       ensure_remote "$remote_url"
       ;; 
     push-subfolders)
-      SUBCONTAINER_MODE=true
-      prepare_subcontainer_plan "$repo_name"
-      ensure_remote_repo_exists "$repo_name" "$(repo_visibility_from_folder "$repo_name")"
-      ensure_remote "$remote_url"
-      sync_with_remote "$current_branch"
-      ensure_subcontainers_ready
-      perform_push "$script_rel" "$current_branch" "$remote_url"
-      ensure_remote "$remote_url"
-      clear_removed_subcontainers
+      perform_subcontainer_push_sequence "$repo_name" "$remote_url" "$current_branch" "$script_rel" "false"
       ;; 
     push-subfolders-releases)
-      SUBCONTAINER_MODE=true
-      prepare_subcontainer_plan "$repo_name"
-      ensure_remote_repo_exists "$repo_name" "$(repo_visibility_from_folder "$repo_name")"
-      ensure_remote "$remote_url"
-      sync_with_remote "$current_branch"
-      ensure_subcontainers_ready_with_releases
-      perform_push "$script_rel" "$current_branch" "$remote_url"
-      ensure_remote "$remote_url"
-      clear_removed_subcontainers
+      perform_subcontainer_push_sequence "$repo_name" "$remote_url" "$current_branch" "$script_rel" "true"
       ;; 
     push-recursive)
       push_recursive_all
@@ -121,22 +182,141 @@ main() {
       perform_push "$script_rel" "$current_branch" "$remote_url"
       ensure_remote "$remote_url"
       ;; 
-    *)
+    *) 
       echo "Unknown action '$action'." >&2
       exit 1
-      ;; 
+      ;;
   esac
 }
 
 # Dependency / token helpers -------------------------------------------------
 ensure_dependencies() {
-  local dep
+  local dep missing=()
   for dep in git curl python3 git-lfs web-ext; do
     if ! command -v "$dep" >/dev/null 2>&1; then
-      echo "Error: dependency '$dep' was not found in PATH." >&2
+      missing+=("$dep")
+    fi
+  done
+
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    return
+  fi
+
+  if [[ "$AUTO_INSTALL_DEPS" != "1" ]]; then
+    for dep in "${missing[@]}"; do
+      log_error "dependency '$dep' was not found in PATH."
+    done
+    exit 1
+  fi
+
+  for dep in "${missing[@]}"; do
+    if ! install_dependency "$dep"; then
+      log_error "dependency '$dep' was not found in PATH."
       exit 1
     fi
   done
+
+  for dep in "${missing[@]}"; do
+    if ! command -v "$dep" >/dev/null 2>&1; then
+      log_error "dependency '$dep' was not found in PATH."
+      exit 1
+    fi
+  done
+
+  # Check Git version for 'git switch' support (2.23+)
+  if command -v git >/dev/null 2>&1; then
+      local git_ver major minor
+      git_ver=$(git --version | awk '{print $3}')
+      major=$(echo "$git_ver" | cut -d. -f1)
+      minor=$(echo "$git_ver" | cut -d. -f2)
+      
+      if [[ "$major" -lt 2 ]] || [[ "$major" -eq 2 && "$minor" -lt 23 ]]; then
+          log_warn "Git version $git_ver is detected. Version 2.23+ is recommended for full script functionality."
+      fi
+  fi
+}
+
+run_as_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+ensure_sudo_or_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    return 0
+  fi
+  if ! command -v sudo >/dev/null 2>&1; then
+    echo "Error: sudo not available. Install missing dependencies manually." >&2
+    return 1
+  fi
+  return 0
+}
+
+apt_update_once() {
+  if [[ "${__APT_UPDATED:-0}" -eq 1 ]]; then
+    return 0
+  fi
+  if ! run_as_root apt-get update; then
+    echo "Error: apt-get update failed. Check your network or sources list." >&2
+    return 1
+  fi
+  __APT_UPDATED=1
+  return 0
+}
+
+install_apt_package() {
+  local pkg=$1
+  if ! command -v apt-get >/dev/null 2>&1; then
+    echo "Error: apt-get not available. Install '$pkg' manually." >&2
+    return 1
+  fi
+  ensure_sudo_or_root || return 1
+  apt_update_once || return 1
+  if ! run_as_root apt-get install -y "$pkg"; then
+    echo "Error: failed to install '$pkg' via apt-get." >&2
+    return 1
+  fi
+  return 0
+}
+
+install_web_ext() {
+  if command -v apt-get >/dev/null 2>&1 && apt-cache show web-ext >/dev/null 2>&1; then
+    install_apt_package web-ext
+    return $?
+  fi
+
+  if ! command -v npm >/dev/null 2>&1; then
+    install_apt_package nodejs || return 1
+    install_apt_package npm || return 1
+  fi
+
+  ensure_sudo_or_root || return 1
+  if ! run_as_root npm install -g web-ext; then
+    echo "Error: failed to install 'web-ext' via npm." >&2
+    return 1
+  fi
+  return 0
+}
+
+install_dependency() {
+  local dep=$1
+  case "$dep" in
+    web-ext)
+      install_web_ext
+      ;;
+    git-lfs)
+      install_apt_package git-lfs
+      ;;
+    git|curl|python3)
+      install_apt_package "$dep"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 ensure_git_lfs() {
@@ -162,7 +342,7 @@ ensure_token() {
     fi
   fi
 
-  echo "Error: provide GITHUB_TOKEN via environment variable or file." >&2
+  log_error "provide GITHUB_TOKEN via environment variable or file."
   exit 1
 }
 
@@ -265,7 +445,7 @@ reauth_github_token() {
   printf "%s\n" "$token" >"$target"
   chmod 600 "$target" 2>/dev/null || true
   
-  local central_target="/home/lucas/Downloads/GITHUB_TOKEN.txt"
+  local central_target="${CENTRAL_CONFIG_DIR}/GITHUB_TOKEN.txt"
   if [[ "$(realpath "$target")" != "$(realpath "$central_target")" ]]; then
      cp "$target" "$central_target"
      chmod 600 "$central_target" 2>/dev/null || true
@@ -315,8 +495,8 @@ reauth_amo_credentials() {
   local repo_dir=$1 key secret
   local key_file="$repo_dir/AMO_API_KEY.txt"
   local secret_file="$repo_dir/AMO_API_SECRET.txt"
-  local central_key="/home/lucas/Downloads/AMO_API_KEY.txt"
-  local central_secret="/home/lucas/Downloads/AMO_API_SECRET.txt"
+  local central_key="${CENTRAL_CONFIG_DIR}/AMO_API_KEY.txt"
+  local central_secret="${CENTRAL_CONFIG_DIR}/AMO_API_SECRET.txt"
 
   echo "Updating AMO Credentials..." >&2
   read -rsp "Enter AMO API Key (Issuer): " key
@@ -384,22 +564,22 @@ reauth_all_recursively() {
 
 # AMO Credentials ------------------------------------------------------------
 ensure_amo_credentials() {
-  local missing=0
+  local missing_creds=0
 
   if ! load_secret_into_var AMO_API_KEY AMO_API_KEY AMO_API_KEY.txt; then
     create_secret_placeholder AMO_API_KEY.txt "chave AMO API Key"
-    echo "Erro: defina AMO_API_KEY ou crie AMO_API_KEY(.txt)." >&2
-    missing=1
+    log_error "Please define AMO_API_KEY or create AMO_API_KEY.txt."
+    missing_creds=1
   fi
 
   if ! load_secret_into_var AMO_API_SECRET AMO_API_SECRET AMO_API_SECRET.txt; then
     create_secret_placeholder AMO_API_SECRET.txt "chave AMO API Secret"
-    echo "Erro: defina AMO_API_SECRET ou crie AMO_API_SECRET(.txt)." >&2
-    missing=1
+    log_error "Please define AMO_API_SECRET or create AMO_API_SECRET.txt."
+    missing_creds=1
   fi
 
-  if [[ $missing -ne 0 ]]; then
-    echo "Dica: gere as credenciais em https://addons.mozilla.org/developers/addon/api/key e cole a chave/segredo na primeira linha de cada arquivo." >&2
+  if [[ $missing_creds -ne 0 ]]; then
+    log_info "Tip: generate credentials at https://addons.mozilla.org/developers/addon/api/key and paste the key/secret in the first line of each file."
     exit 1
   fi
 }
@@ -437,7 +617,7 @@ load_secret_into_var() {
       value=$(read_first_line "$candidate") || continue
       if [[ -n "$value" ]]; then
         printf -v "$var_name" '%s' "$value"
-        export "$var_name"
+        declare -x "$var_name"
         return 0
       fi
     fi
@@ -561,7 +741,8 @@ EOF
       "${cmd[@]}" > web-ext-output.log 2>&1 &
       local pid=$!
       
-      local start_time=$(date +%s)
+      local start_time
+      start_time=$(date +%s)
       local max_wait=600 # 10 min hard timeout
       local found_success=0
       
@@ -676,10 +857,10 @@ ensure_webext_ignore() {
     "GITHUB_TOKEN.txt"
     "AMO_API_KEY"
     "AMO_API_KEY.txt"
-    "AMO_API_SECRET",
-    "AMO_API_SECRET.txt",
-    "gemini-gcloud-key.json",
-    "create_and_push_repo.sh",
+    "AMO_API_SECRET"
+    "AMO_API_SECRET.txt"
+    "gemini-gcloud-key.json"
+    "create_and_push_repo.sh"
     "create_firefox-amo_push_github.sh"
     "install-addon-policy.sh"
     "README.md"
@@ -843,6 +1024,48 @@ init_git_repo() {
   fi
 }
 
+warn_root_owned() {
+  local root_items
+  mapfile -t root_items < <(find "$ROOT_REPO_DIR" -maxdepth 1 -user root -print 2>/dev/null)
+  if [[ ${#root_items[@]} -eq 0 ]]; then
+    return 0
+  fi
+  echo "Detecção de itens carregados por root (não há permissão para chown sozinho):" >&2
+  for p in "${root_items[@]}"; do
+    printf '  %s\n' "$p" >&2
+  done
+  printf 'Execute o sudo chown -R lucas:lucas %s\n' "${root_items[*]}" >&2
+  return 1
+}
+
+warn_index_lock() {
+  local locks=()
+  while IFS= read -r -d '' file; do
+    locks+=("$file")
+  done < <(find "$ROOT_REPO_DIR" -name "index.lock" -print0 2>/dev/null)
+  if [[ ${#locks[@]} -eq 0 ]]; then
+    return 0
+  fi
+  echo "Atenção: existem arquivos index.lock ativos:" >&2
+  for lock in "${locks[@]}"; do
+    printf '  %s\n' "$lock" >&2
+  done
+  echo "Remova-os (rm <caminho>) ou encerre o processo antes de rodar novamente." >&2
+  return 1
+}
+
+ensure_root_commit() {
+  if git rev-parse HEAD >/dev/null 2>&1; then
+    return
+  fi
+  git add . >/dev/null 2>&1 || true
+  GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-luascfl}" \
+  GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-luascfl@example.com}" \
+  GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-luascfl}" \
+  GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-luascfl@example.com}" \
+  git commit --allow-empty -m "initial commit" >/dev/null 2>&1 || true
+}
+
 ensure_main_branch() {
   local current
   current=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
@@ -871,6 +1094,96 @@ repo_visibility_from_folder() {
   else
     echo "public"
   fi
+}
+
+github_repo_exists() {
+  local repo_name=$1 status
+  status=$(curl -s -o /dev/null -w "%{http_code}" \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    "$GITHUB_API_URL/repos/luascfl/$repo_name")
+  [[ "$status" == "200" ]]
+}
+
+github_rename_repo() {
+  local old_name=$1 new_name=$2 response status
+  response=$(mktemp)
+  status=$(curl -sS -o "$response" -w "%{http_code}" \
+    -X PATCH \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    -d "{\"name\":\"$new_name\"}" \
+    "$GITHUB_API_URL/repos/luascfl/$old_name")
+  if [[ "$status" != "200" ]]; then
+    echo "Failed to rename GitHub repo '$old_name' to '$new_name' (status $status)." >&2
+    cat "$response" >&2
+  else
+    echo "Renamed GitHub repo '$old_name' to '$new_name'." >&2
+  fi
+  rm -f "$response"
+}
+
+detect_previous_subdir_path() {
+  local subdir=$1 rename_line
+  rename_line=$(git -C "$ROOT_REPO_DIR" log --diff-filter=R --name-status --pretty=format:'' -- "$subdir" 2>/dev/null | awk '/^R/ {print $2; exit}')
+  printf '%s' "$rename_line"
+}
+
+handle_subcontainer_remote_rename() {
+  local subdir=$1 current_repo=$2 old_path old_repo
+  if [[ -z "$ROOT_REPO_DIR" ]]; then
+    return
+  fi
+  old_path=$(detect_previous_subdir_path "$subdir")
+  [[ -z "$old_path" || "$old_path" == "$subdir" ]] && return
+  old_repo=$(format_subcontainer_repo_name "$ROOT_REPO_NAME" "$old_path")
+  if [[ "$old_repo" == "$current_repo" ]]; then
+    return
+  fi
+  if github_repo_exists "$current_repo"; then
+    return
+  fi
+  if ! github_repo_exists "$old_repo"; then
+    return
+  fi
+  echo "Detected rename: '$old_path' -> '$subdir'. Renaming remote from '$old_repo' to '$current_repo'." >&2
+  github_rename_repo "$old_repo" "$current_repo"
+}
+
+remote_should_be_ignored() {
+  local repo=$1 ignored
+  for ignored in "${IGNORED_REMOTE_REPOS[@]}"; do
+    if [[ "$repo" == "$ignored" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+delete_remote_repo() {
+  local repo_name=$1 response status curl_exit
+  response=$(mktemp)
+  set +e
+  status=$(curl -sS -w "%{http_code}" -o "$response" \
+    -X DELETE \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/luascfl/$repo_name")
+  curl_exit=$?
+  set -e
+
+  case "$status" in
+    204)
+      echo "Deleted ignored remote 'luascfl/$repo_name'." >&2
+      ;;
+    404)
+      echo "Ignored remote 'luascfl/$repo_name' not found; nothing to delete." >&2
+      ;;
+    *)
+      echo "Failed to delete ignored remote 'luascfl/$repo_name' (HTTP $status, curl $curl_exit)." >&2
+      cat "$response" >&2
+      ;;
+  esac
+  rm -f "$response"
 }
 
 ensure_remote_repo_exists() {
@@ -1003,7 +1316,7 @@ push_recursive_all() {
   local -a pushed=()
   local -a failed=()
   local -a ignored=()
-  local path subdir script action found_xpi
+  local path subdir script action
 
   base_dir=$(pwd)
   echo "==> Starting recursive push for all known types..." >&2
@@ -1254,6 +1567,8 @@ ensure_single_subcontainer_ready() {
     echo "Skipping '$subdir' because it no longer exists locally." >&2
     return
   fi
+
+  handle_subcontainer_remote_rename "$subdir" "$repo_name"
 
   ensure_remote_repo_exists "$repo_name" "$visibility"
   remote_url=$(resolve_remote_url "$repo_name")
@@ -1712,11 +2027,18 @@ push_commit_to_remote() {
   fi
   args+=("$remote_url" "$refspec")
   if [[ "${GITHUB_REMOTE_PROTOCOL:-https}" == "https" ]]; then
-    output=$(run_with_https_credentials "${args[@]}" 2>&1)
+    if output=$(run_with_https_credentials "${args[@]}" 2>&1); then
+      status=0
+    else
+      status=$?
+    fi
   else
-    output=$("${args[@]}" 2>&1)
+    if output=$("${args[@]}" 2>&1); then
+      status=0
+    else
+      status=$?
+    fi
   fi
-  status=$?
   printf "%s\n" "$output"
   return $status
 }
@@ -1821,7 +2143,6 @@ auto_ignore_problematic_files() {
   local repo_path=$1
   (
     cd "$repo_path" || return
-    local changed=0
     
     # 1. Handle GitHub Workflows (fixes 'refusing to allow... workflow scope' error)
     if [[ -d ".github/workflows" ]]; then
@@ -1829,7 +2150,6 @@ auto_ignore_problematic_files() {
            [[ -s .gitignore && "$(tail -c 1 .gitignore | wc -l)" -eq 0 ]] && echo "" >> .gitignore
            echo ".github/workflows/" >> .gitignore
            echo "   [Auto-Fix] Ignored .github/workflows/ to prevent permission errors." >&2
-           changed=1
        fi
        # Remove from index if present
        git rm -r --cached --ignore-unmatch .github/workflows/ >/dev/null 2>&1 || true
@@ -1865,7 +2185,6 @@ auto_ignore_problematic_files() {
                 [[ -s .gitignore && "$(tail -c 1 .gitignore | wc -l)" -eq 0 ]] && echo "" >> .gitignore
                 echo "$pattern" >> .gitignore
                 echo "   [Auto-Fix] Ignored sensitive pattern '$pattern' found in repo." >&2
-                changed=1
             fi
             
             # Remove specific files from index
@@ -1894,7 +2213,6 @@ auto_ignore_problematic_files() {
                     echo "$clean_item" >> .gitignore
                  fi
                  echo "   [Auto-Fix] Ignored excluded item '$clean_item'." >&2
-                 changed=1
              fi
              git rm -r --cached --ignore-unmatch "$clean_item" >/dev/null 2>&1 || true
          fi
@@ -2097,6 +2415,61 @@ run_git_with_credentials() {
   else
     "$@"
   fi
+}
+
+list_codex_dirs() {
+  find "$ROOT_REPO_DIR" -maxdepth 2 -type d -name "codex_*" -print0
+}
+
+should_run_global_codex_sync() {
+  local base
+  base=$(basename "$ROOT_REPO_DIR")
+  if [[ "$base" == codex_* ]]; then
+    return 1
+  fi
+  if [[ -n $(find "$ROOT_REPO_DIR" -maxdepth 1 -type d -name "codex_*" -print -quit) ]]; then
+    return 0
+  fi
+  return 1
+}
+
+log_codex_sync() {
+  local status=$1 dir=$2 log_file="$ROOT_REPO_DIR/codex_sync.log"
+  local msg
+  if [[ "$status" -eq 0 ]]; then
+    msg="SUCCESS"
+  else
+    msg="FAIL"
+  fi
+  printf '%s %s %s\n' "$(date -Iseconds)" "$msg" "$dir" >>"$log_file"
+}
+
+run_codex_sync() {
+  local dir
+  local -a failed=()
+  local ok=0
+  while IFS= read -r -d '' dir; do
+    echo "=== Syncing $dir ==="
+    if (
+      cd "$dir" || exit 1
+      ./create_and_push_repo.sh push-subfolders
+    ); then
+      ((ok++))
+      log_codex_sync 0 "$dir"
+    else
+      failed+=("$dir")
+      log_codex_sync 1 "$dir"
+    fi
+  done < <(list_codex_dirs)
+  echo "Codex sync summary: success=$ok failed=${#failed[@]}"
+  if [[ ${#failed[@]} -gt 0 ]]; then
+    printf 'Failed directories:\n'
+    for dir in "${failed[@]}"; do
+      printf '  - %s\n' "$dir"
+    done
+    return 1
+  fi
+  return 0
 }
 
 push_with_credentials() {
