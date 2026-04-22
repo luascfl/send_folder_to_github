@@ -94,6 +94,7 @@ perform_subcontainer_push_sequence() {
   perform_push "$script_rel" "$current_branch" "$remote_url"
   ensure_remote "$remote_url"
   clear_removed_subcontainers
+  run_parent_topic_verifier_auto "$ROOT_REPO_DIR"
 
   if [[ "$with_releases" == "false" ]] && should_run_global_codex_sync; then
     run_codex_sync
@@ -169,9 +170,6 @@ main() {
       ;; 
     sync-scripts)
       sync_scripts_recursively
-      ;;
-    verify-parent-topics)
-      run_parent_topic_verifier "${@:2}"
       ;;
     push-firefox-amo-github)
       SUBCONTAINER_MODE=false
@@ -987,11 +985,10 @@ prompt_repo_action() {
   echo "                    detecting special types (Codex, Firefox Ext," >&2
   echo "                    Releases) automatically." >&2
   echo "  reauth          : Updates GitHub/AMO credentials." >&2
-  echo "  verify-parent-topics : Audits parent topics for codex subcontainers." >&2
   echo "----------------------------------------------------------------" >&2
   
   while true; do
-    if ! read -rp "Choose action for repository '$repo_name' [push/push-recursive/reauth/verify-parent-topics] (default: push): " choice; then
+    if ! read -rp "Choose action for repository '$repo_name' [push/push-recursive/reauth] (default: push): " choice; then
       choice=""
     fi
     case "${choice,,}" in
@@ -1017,11 +1014,7 @@ prompt_repo_action() {
         echo "reauth"
         return
         ;;
-      verify-parent-topics|verify_parent_topics|verify-topics|topics-audit)
-        echo "verify-parent-topics"
-        return
-        ;;
-      *) echo "Invalid input. Type 'push', 'push-recursive', 'reauth', or 'verify-parent-topics'." >&2 ;; 
+      *) echo "Invalid input. Type 'push', 'push-recursive', or 'reauth'." >&2 ;; 
     esac
   done
 }
@@ -1348,17 +1341,6 @@ ensure_subcontainer_parent_topic() {
   ensure_repo_contains_topic "$repo_name" "$parent_topic"
 }
 
-verify_parent_topics_usage() {
-  cat <<'EOF'
-Uso: ./create_and_push_repo.sh verify-parent-topics [BASE_DIR] [--no-fix] [--owner <owner>] [--base-dir <dir>]
-  BASE_DIR            diretório base para procurar pastas codex* (default: cwd)
-  padrão              aplica topic esperado automaticamente quando estiver faltando
-  --no-fix            roda só auditoria, sem aplicar mudanças
-  --owner <owner>     owner GitHub (default: GITHUB_OWNER ou luascfl)
-  --base-dir <dir>    mesmo efeito de BASE_DIR posicional
-EOF
-}
-
 verify_api_get_topics_status() {
   local owner=$1 repo=$2 token=$3 output_file=$4
   curl -sS -o "$output_file" -w "%{http_code}" \
@@ -1367,13 +1349,15 @@ verify_api_get_topics_status() {
     "https://api.github.com/repos/$owner/$repo/topics"
 }
 
+VERIFY_LAST_TOPICS_PUT_STATUS=""
+
 verify_api_apply_expected_topic() {
-  local owner=$1 repo=$2 token=$3 expected=$4 current_topics_file=$5 output_file=$6 payload_file status
+  local owner=$1 repo=$2 token=$3 expected=$4 current_topics_file=$5 output_file=$6 payload_file
   payload_file=$(mktemp)
   jq --arg topic "$expected" '{names: ((.names // []) + [$topic] | map(ascii_downcase) | unique)}' \
     "$current_topics_file" > "$payload_file"
 
-  status=$(curl -sS -o "$output_file" -w "%{http_code}" \
+  VERIFY_LAST_TOPICS_PUT_STATUS=$(curl -sS -o "$output_file" -w "%{http_code}" \
     -X PUT \
     -H "Authorization: token $token" \
     -H "Accept: application/vnd.github+json" \
@@ -1381,79 +1365,47 @@ verify_api_apply_expected_topic() {
     "https://api.github.com/repos/$owner/$repo/topics")
   rm -f "$payload_file"
 
-  [[ "$status" == "200" ]]
+  [[ "$VERIFY_LAST_TOPICS_PUT_STATUS" == "200" ]]
 }
 
-run_parent_topic_verifier() {
-  local base_dir="${ROOT_REPO_DIR:-$(pwd)}"
+run_parent_topic_verifier_auto() {
+  local base_dir=${1:-${ROOT_REPO_DIR:-$(pwd)}}
   local owner="${GITHUB_OWNER:-luascfl}"
   local token="${GITHUB_TOKEN:-}"
-  local fix_mode=1
 
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --fix)
-        fix_mode=1
-        ;;
-      --no-fix)
-        fix_mode=0
-        ;;
-      --owner)
-        shift
-        owner=${1:-}
-        ;;
-      --base-dir)
-        shift
-        base_dir=${1:-}
-        ;;
-      --help|-h)
-        verify_parent_topics_usage
-        return 0
-        ;;
-      --*)
-        echo "Erro: opção desconhecida '$1'" >&2
-        return 1
-        ;;
-      *)
-        base_dir=$1
-        ;;
-    esac
-    shift
-  done
+  declare -a codex_roots=()
+  declare -A codex_seen=()
 
-  if [[ -z "$base_dir" ]]; then
-    echo "Erro: BASE_DIR não pode ser vazio" >&2
-    return 1
+  if [[ "$(basename "$base_dir")" == codex* ]]; then
+    codex_roots+=("$base_dir")
+    codex_seen["$base_dir"]=1
+  fi
+
+  local root
+  while IFS= read -r -d '' root; do
+    [[ -n "${codex_seen[$root]:-}" ]] && continue
+    codex_roots+=("$root")
+    codex_seen["$root"]=1
+  done < <(find "$base_dir" -mindepth 1 -maxdepth 1 -type d -name 'codex*' -print0)
+
+  if [[ ${#codex_roots[@]} -eq 0 ]]; then
+    return 0
   fi
 
   if [[ -z "$token" && -f "$base_dir/GITHUB_TOKEN.txt" ]]; then
     token=$(tr -d '\r\n' < "$base_dir/GITHUB_TOKEN.txt")
   fi
-
-  if [[ -z "$token" ]]; then
-    echo "Erro: defina GITHUB_TOKEN ou crie $base_dir/GITHUB_TOKEN.txt" >&2
-    return 1
+  if [[ -z "$token" && -f "$HOME/Downloads/GITHUB_TOKEN.txt" ]]; then
+    token=$(tr -d '\r\n' < "$HOME/Downloads/GITHUB_TOKEN.txt")
   fi
-
-  if ! command -v jq >/dev/null 2>&1; then
-    echo "Erro: dependência ausente: jq" >&2
-    return 1
+  if [[ -z "$token" ]]; then
+    echo "Aviso: sem GITHUB_TOKEN, etapa automática de parent topics foi pulada." >&2
+    return 0
   fi
 
   declare -A expected_topic_by_repo=()
   declare -A source_by_repo=()
   declare -a expected_repos=()
-  declare -a codex_roots=()
-
-  local root
-  while IFS= read -r -d '' root; do
-    codex_roots+=("$root")
-  done < <(find "$base_dir" -mindepth 1 -maxdepth 1 -type d -name 'codex*' -print0)
-
-  if [[ ${#codex_roots[@]} -eq 0 ]]; then
-    echo "Nenhuma pasta codex* encontrada em $base_dir" >&2
-    return 1
-  fi
 
   local root_name parent_topic state_file state_dir subdir repo
   for root in "${codex_roots[@]}"; do
@@ -1490,15 +1442,15 @@ run_parent_topic_verifier() {
   done
 
   if [[ ${#expected_repos[@]} -eq 0 ]]; then
-    echo "Nenhum repo esperado encontrado em arquivos .subcontainers" >&2
-    return 1
+    echo "Nenhum repo esperado encontrado em arquivos .subcontainers para verificação." >&2
+    return 0
   fi
 
-  printf 'BASE_DIR\t%s\n' "$base_dir"
-  printf 'OWNER\t%s\n' "$owner"
-  printf 'FIX_MODE\t%s\n' "$fix_mode"
-  printf 'CODEX_ROOTS\t%s\n' "${#codex_roots[@]}"
-  printf 'EXPECTED_REPOS\t%s\n\n' "${#expected_repos[@]}"
+  printf 'TOPIC_STAGE_BASE_DIR\t%s\n' "$base_dir"
+  printf 'TOPIC_STAGE_OWNER\t%s\n' "$owner"
+  printf 'TOPIC_STAGE_AUTO_FIX\t1\n'
+  printf 'TOPIC_STAGE_CODEX_ROOTS\t%s\n' "${#codex_roots[@]}"
+  printf 'TOPIC_STAGE_EXPECTED_REPOS\t%s\n\n' "${#expected_repos[@]}"
   printf 'status\trepo\texpected_topic\tcurrent_topics\tsource\n'
 
   local tmp_expected_file tmp_topics_response tmp_topics_put_response tmp_repos_page tmp_api_file
@@ -1526,20 +1478,15 @@ run_parent_topic_verifier() {
           printf 'ok\t%s\t%s\t%s\t%s\n' "$repo" "$expected" "$topics" "$source"
           ok=$((ok + 1))
         else
-          if [[ "$fix_mode" == "1" ]]; then
-            if verify_api_apply_expected_topic "$owner" "$repo" "$token" "$expected" "$tmp_topics_response" "$tmp_topics_put_response"; then
-              fixed_topics=$(jq -r '(.names // []) | join(",")' "$tmp_topics_put_response")
-              printf 'fixed\t%s\t%s\t%s\t%s\n' "$repo" "$expected" "$fixed_topics" "$source"
-              fixed=$((fixed + 1))
-            else
-              body=$(tr '\n' ' ' < "$tmp_topics_put_response")
-              printf 'fix_error\t%s\t%s\tHTTP_error %s\t%s\n' "$repo" "$expected" "$body" "$source"
-              missing_topic=$((missing_topic + 1))
-              fix_error=$((fix_error + 1))
-            fi
+          if verify_api_apply_expected_topic "$owner" "$repo" "$token" "$expected" "$tmp_topics_response" "$tmp_topics_put_response"; then
+            fixed_topics=$(jq -r '(.names // []) | join(",")' "$tmp_topics_put_response")
+            printf 'fixed\t%s\t%s\t%s\t%s\n' "$repo" "$expected" "$fixed_topics" "$source"
+            fixed=$((fixed + 1))
           else
-            printf 'missing_topic\t%s\t%s\t%s\t%s\n' "$repo" "$expected" "$topics" "$source"
+            body=$(tr '\n' ' ' < "$tmp_topics_put_response")
+            printf 'fix_error\t%s\t%s\tHTTP_%s %s\t%s\n' "$repo" "$expected" "$VERIFY_LAST_TOPICS_PUT_STATUS" "$body" "$source"
             missing_topic=$((missing_topic + 1))
+            fix_error=$((fix_error + 1))
           fi
         fi
         ;;
@@ -1555,7 +1502,7 @@ run_parent_topic_verifier() {
     esac
   done < "$tmp_expected_file"
 
-  printf '\nSUMMARY\n'
+  printf '\nTOPIC_STAGE_SUMMARY\n'
   printf 'ok\t%s\n' "$ok"
   printf 'fixed\t%s\n' "$fixed"
   printf 'missing_topic\t%s\n' "$missing_topic"
@@ -1768,6 +1715,7 @@ push_recursive_all() {
   else
     printf '    (none)\n' >&2
   fi
+  run_parent_topic_verifier_auto "$base_dir"
 }
 
 prepare_subcontainer_plan() {

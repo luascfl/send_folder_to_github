@@ -18,10 +18,11 @@
   - recuperação de gitdir quebrado (`repair_submodule_gitdir_if_needed`);
   - proteção contra limpeza indevida em rename manual (`renamed_previous` em `prepare_subcontainer_plan`);
   - validação de repositório isolado por subcontainer (`is_subcontainer_git_repo_ready`) para impedir falso positivo de `rev-parse --is-inside-work-tree` no repo pai.
-  - merge do fluxo `verify_parent_topics` no próprio `create_and_push_repo.sh` via ação `verify-parent-topics`, com aplicação automática de tag por padrão (e `--no-fix` para modo só auditoria).
+  - merge do fluxo `verify_parent_topics` no próprio `create_and_push_repo.sh` como etapa automática dos fluxos existentes (`push-subfolders`, `push-subfolders-releases` e `push-recursive`), sem ação/flag dedicada;
   - remoção do arquivo externo `verify_parent_topics.sh` e da propagação recursiva desse arquivo para subrepos.
 - Harness local controlado confirmou:
   - rename manual com gitdir legado não entra em `__SUBCONTAINERS_TO_CLEAR` (`RENAME_CLEAR=0`);
   - pasta removida sem rename entra em limpeza (`DELETE_CLEAR=1`);
   - recuperação de gitdir quebrado recria repo isolado da subpasta (`ISOLATED_GIT_DIR=ok`, `ISOLATED_CHECK=ok`).
-- `./create_and_push_repo.sh verify-parent-topics /home/lucas/Downloads` executado com saída observável; houve `HTTP_401 Bad credentials` (token atual inválido para API), confirmando que o comando integrado está ativo e consultando a API.
+- `./create_and_push_repo.sh verify-parent-topics` agora retorna `Unknown action`, comprovando remoção da flag dedicada.
+- O script passou a chamar `run_parent_topic_verifier_auto` automaticamente dentro dos fluxos existentes de push que envolvem codex.
