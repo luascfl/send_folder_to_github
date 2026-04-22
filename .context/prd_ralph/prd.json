@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "project": "send_folder_to_github stabilization",
+  "overview": "Padronizar o fluxo de publica\u00e7\u00e3o de pastas para GitHub com subcontainers, auditoria de parent topics e seguran\u00e7a operacional.",
+  "goals": [
+    "Garantir que subcontainers tenham topic parent consistente",
+    "Reduzir risco de publicar reposit\u00f3rios indevidos",
+    "Fornecer auditoria reproduz\u00edvel para valida\u00e7\u00e3o pr\u00e9 e p\u00f3s push"
+  ],
+  "nonGoals": [
+    "Reescrever integralmente create_and_push_repo.sh",
+    "Introduzir integra\u00e7\u00e3o externa fora de GitHub API"
+  ],
+  "successMetrics": [
+    "verify_parent_topics.sh reporta missing_topic=0 para repos esperados",
+    "Auditoria identifica e separa missing_repo versus orphan tmp repos",
+    "Scripts principais passam valida\u00e7\u00e3o de sintaxe shell"
+  ],
+  "qualityGates": [
+    "bash -n create_and_push_repo.sh",
+    "bash -n verify_parent_topics.sh"
+  ],
+  "stories": [
+    {
+      "id": "US-SFG-001",
+      "title": "Concluir baseline de contexto e auditoria de topics",
+      "status": "open",
+      "description": "Como mantenedor, quero ter contexto GSD+Ralph m\u00ednimo e auditoria execut\u00e1vel para controlar parent topics dos subcontainers.",
+      "acceptanceCriteria": [
+        "Existem .context/docs/planning_gsd/PROJECT.md e STATE.md",
+        "Existe .context/prd_ralph/prd.json v\u00e1lido para ralph build",
+        "verify_parent_topics.sh roda e produz resumo com ok/missing_topic/missing_repo"
+      ],
+      "startedAt": null,
+      "completedAt": null,
+      "updatedAt": "2026-04-22T20:22:42.417730+00:00"
+    },
+    {
+      "id": "US-SFG-002",
+      "title": "Aplicar parent topic automático em repos órfãos mapeados",
+      "status": "open",
+      "description": "Como mantenedor, quero corrigir tópicos parent nos repos tmp órfãos com um fluxo controlado.",
+      "acceptanceCriteria": [
+        "Repos órfãos relevantes têm topic parent esperado",
+        "Diferença entre órfão legítimo e erro de nomenclatura fica documentada",
+        "Auditoria final registra evidências técnicas da correção"
+      ],
+      "startedAt": null,
+      "completedAt": null,
+      "updatedAt": "2026-04-22T00:00:00Z"
+    },
+    {
+      "id": "US-SFG-003",
+      "title": "Robustecer rename e remoção de subcontainers",
+      "status": "in_progress",
+      "description": "Como mantenedor, quero que o fluxo trate rename manual e gitdir quebrado sem perder vínculo de subcontainer.",
+      "acceptanceCriteria": [
+        "create_and_push_repo.sh detecta rename também por fallback de gitdir legado",
+        "Quando .git de subcontainer estiver quebrado, o script recupera ou reinicializa metadados locais com log explícito",
+        "Renames manuais com fallback não disparam limpeza indevida de repo antigo em __SUBCONTAINERS_TO_CLEAR",
+        "Operações de branch, remote e push só rodam quando a subpasta resolve para toplevel igual ao próprio diretório, sem cair no repo pai"
+      ],
+      "startedAt": null,
+      "completedAt": null,
+      "updatedAt": "2026-04-22T21:06:00Z"
+    }
+  ]
+}

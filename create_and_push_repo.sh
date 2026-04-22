@@ -1122,9 +1122,31 @@ github_rename_repo() {
   rm -f "$response"
 }
 
+extract_submodule_module_name_from_gitdir() {
+  local subdir=$1 gitfile line raw
+  gitfile="$subdir/.git"
+  [[ -f "$gitfile" ]] || return
+  line=$(head -n 1 "$gitfile" 2>/dev/null || true)
+  [[ "$line" == gitdir:* ]] || return
+  raw=${line#gitdir:}
+  raw=${raw##[[:space:]]}
+  raw=${raw%%$'\r'}
+  printf '%s' "${raw##*/}"
+}
+
+detect_previous_subdir_from_gitdir() {
+  local subdir=$1 module_name
+  module_name=$(extract_submodule_module_name_from_gitdir "$subdir")
+  [[ -z "$module_name" || "$module_name" == "$subdir" ]] && return
+  printf '%s' "$module_name"
+}
+
 detect_previous_subdir_path() {
   local subdir=$1 rename_line
   rename_line=$(git -C "$ROOT_REPO_DIR" log --diff-filter=R --name-status --pretty=format:'' -- "$subdir" 2>/dev/null | awk '/^R/ {print $2; exit}')
+  if [[ -z "$rename_line" ]]; then
+    rename_line=$(detect_previous_subdir_from_gitdir "$subdir")
+  fi
   printf '%s' "$rename_line"
 }
 
@@ -1221,6 +1243,101 @@ ensure_remote_repo_exists() {
        exit 1 ;; 
   esac
   rm -f "$response"
+}
+
+sanitize_topic_segment() {
+  local value=$1
+  value=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+  value=${value//[^a-z0-9]/-}
+  while [[ "$value" == *--* ]]; do
+    value=${value//--/-}
+  done
+  value=${value##-}
+  value=${value%%-}
+  if [[ -z "$value" ]]; then
+    value="repo"
+  fi
+  printf "%s" "$value"
+}
+
+build_parent_repo_topic() {
+  local root_repo=$1 sanitized
+  sanitized=$(sanitize_topic_segment "$root_repo")
+  printf "parent-%s" "$sanitized"
+}
+
+ensure_repo_contains_topic() {
+  local repo_name=$1 topic=$2 get_response put_response get_status put_status payload
+  [[ -z "$topic" ]] && return
+  get_response=$(mktemp)
+  get_status=$(curl -sS -w "%{http_code}" -o "$get_response" \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/luascfl/$repo_name/topics")
+
+  case "$get_status" in
+    200)
+      payload=$(python3 - "$get_response" "$topic" <<'PY'
+import json
+import sys
+
+path, topic = sys.argv[1], sys.argv[2]
+with open(path, "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+existing = data.get("names") or []
+merged = []
+seen = set()
+for item in [*existing, topic]:
+    if not isinstance(item, str):
+        continue
+    normalized = item.strip().lower()
+    if not normalized or normalized in seen:
+        continue
+    seen.add(normalized)
+    merged.append(normalized)
+print(json.dumps({"names": merged}, separators=(",", ":")))
+PY
+      )
+      ;;
+    404)
+      echo "Topic sync skipped for '$repo_name' because repository was not found." >&2
+      rm -f "$get_response"
+      return
+      ;;
+    *)
+      echo "Failed to read topics for '$repo_name' (HTTP $get_status)." >&2
+      cat "$get_response" >&2
+      rm -f "$get_response"
+      return
+      ;;
+  esac
+  rm -f "$get_response"
+
+  put_response=$(mktemp)
+  put_status=$(curl -sS -w "%{http_code}" -o "$put_response" \
+    -X PUT \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/luascfl/$repo_name/topics" \
+    -d "$payload")
+
+  case "$put_status" in
+    200) ;;
+    *)
+      echo "Failed to update topics for '$repo_name' (HTTP $put_status)." >&2
+      cat "$put_response" >&2
+      ;;
+  esac
+  rm -f "$put_response"
+}
+
+ensure_subcontainer_parent_topic() {
+  local repo_name=$1 parent_topic
+  if [[ -z "${ROOT_REPO_NAME:-}" || "$ROOT_REPO_NAME" != codex* ]]; then
+    return
+  fi
+  parent_topic=$(build_parent_repo_topic "$ROOT_REPO_NAME")
+  ensure_repo_contains_topic "$repo_name" "$parent_topic"
 }
 
 ensure_remote() {
@@ -1402,6 +1519,7 @@ prepare_subcontainer_plan() {
   fi
 
   declare -A current=()
+  declare -A renamed_previous=()
   local -a subdirs=()
   while IFS= read -r -d '' path; do
     path=${path#./}
@@ -1423,16 +1541,24 @@ prepare_subcontainer_plan() {
     subdirs+=("$path")
   done < <(find . -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null || true)
 
-  local subdir repo_name visibility
+  local subdir repo_name visibility old_hint
   for subdir in "${subdirs[@]}"; do
     repo_name=$(format_subcontainer_repo_name "$root_repo_name" "$subdir")
     visibility=$(repo_visibility_from_folder "$subdir")
     current["$subdir"]="$repo_name"
     __SUBCONTAINERS_TO_PUSH+=("$subdir|$repo_name|$visibility")
+
+    old_hint=$(detect_previous_subdir_from_gitdir "$subdir")
+    if [[ -n "$old_hint" && -n "${previous[$old_hint]+_}" ]]; then
+      renamed_previous["$old_hint"]="$subdir"
+    fi
   done
 
   local prev_dir
   for prev_dir in "${!previous[@]}"; do
+    if [[ -n "${renamed_previous[$prev_dir]+_}" ]]; then
+      continue
+    fi
     if [[ -z "${current[$prev_dir]+_}" ]]; then
       __SUBCONTAINERS_TO_CLEAR+=("$prev_dir|${previous[$prev_dir]}")
       remove_submodule_config "$prev_dir"
@@ -1560,6 +1686,49 @@ else:
 PY
 }
 
+is_subcontainer_git_repo_ready() {
+  local subdir=$1 toplevel subdir_real top_real
+  toplevel=$(git -C "$subdir" rev-parse --show-toplevel 2>/dev/null || true)
+  [[ -n "$toplevel" ]] || return 1
+  subdir_real=$(cd "$subdir" && pwd -P)
+  top_real=$(cd "$toplevel" && pwd -P)
+  [[ "$top_real" == "$subdir_real" ]]
+}
+
+repair_submodule_gitdir_if_needed() {
+  local subdir=$1 gitfile line raw module_name old_module_path new_module_path
+  gitfile="$subdir/.git"
+  [[ -f "$gitfile" ]] || return
+
+  if is_subcontainer_git_repo_ready "$subdir"; then
+    return
+  fi
+
+  line=$(head -n 1 "$gitfile" 2>/dev/null || true)
+  [[ "$line" == gitdir:* ]] || return
+  raw=${line#gitdir:}
+  raw=${raw##[[:space:]]}
+  raw=${raw%%$'\r'}
+  module_name=${raw##*/}
+  [[ -z "$module_name" ]] && return
+
+  old_module_path=".git/modules/$module_name"
+  new_module_path=".git/modules/$subdir"
+
+  if [[ "$module_name" != "$subdir" && -d "$old_module_path" && ! -e "$new_module_path" ]]; then
+    mkdir -p "$(dirname "$new_module_path")"
+    mv "$old_module_path" "$new_module_path"
+    printf 'gitdir: ../.git/modules/%s\n' "$subdir" > "$gitfile"
+    if is_subcontainer_git_repo_ready "$subdir"; then
+      echo "Recovered subcontainer gitdir for '$subdir' from legacy module '$module_name'." >&2
+      return
+    fi
+  fi
+
+  echo "Subcontainer '$subdir' has stale git metadata ('$module_name'). Reinitializing local git metadata." >&2
+  rm -f "$gitfile"
+}
+
 ensure_single_subcontainer_ready() {
   local subdir=$1 repo_name=$2 visibility=$3 remote_url
 
@@ -1569,8 +1738,9 @@ ensure_single_subcontainer_ready() {
   fi
 
   handle_subcontainer_remote_rename "$subdir" "$repo_name"
-
+  repair_submodule_gitdir_if_needed "$subdir"
   ensure_remote_repo_exists "$repo_name" "$visibility"
+  ensure_subcontainer_parent_topic "$repo_name"
   remote_url=$(resolve_remote_url "$repo_name")
 
   ensure_submodule_repo_initialized "$subdir"
@@ -1583,10 +1753,17 @@ ensure_single_subcontainer_ready() {
 
 ensure_submodule_repo_initialized() {
   local subdir=$1
-  if [[ -e "$subdir/.git" ]]; then
+  repair_submodule_gitdir_if_needed "$subdir"
+  if is_subcontainer_git_repo_ready "$subdir"; then
     return
   fi
+  rm -rf "$subdir/.git"
   git -C "$subdir" init >/dev/null
+  if ! is_subcontainer_git_repo_ready "$subdir"; then
+    echo "Failed to initialize isolated git repo for '$subdir'." >&2
+    return 1
+  fi
+
 }
 
 ensure_submodule_branch() {
