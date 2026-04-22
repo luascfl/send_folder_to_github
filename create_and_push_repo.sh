@@ -1428,12 +1428,24 @@ perform_push() {
   fi
 }
 
+sync_management_scripts_to_dir() {
+  local source_dir=$1 target_dir=$2
+  cp "$source_dir/create_and_push_repo.sh" "$target_dir/create_and_push_repo.sh"
+  chmod +x "$target_dir/create_and_push_repo.sh" >/dev/null 2>&1 || true
+
+  if [[ -f "$source_dir/verify_parent_topics.sh" ]]; then
+    cp "$source_dir/verify_parent_topics.sh" "$target_dir/verify_parent_topics.sh"
+    chmod +x "$target_dir/verify_parent_topics.sh" >/dev/null 2>&1 || true
+  fi
+}
+
+
 push_recursive_all() {
   local base_dir
   local -a pushed=()
   local -a failed=()
   local -a ignored=()
-  local path subdir script action
+  local path subdir action
 
   base_dir=$(pwd)
   echo "==> Starting recursive push for all known types..." >&2
@@ -1461,13 +1473,10 @@ push_recursive_all() {
         continue
     fi
     
-    script="$path/create_and_push_repo.sh"
-    
     propagate_credentials_to_subdir "$path"
     
-    # Update/Install script
-    cp "$base_dir/create_and_push_repo.sh" "$script"
-    chmod +x "$script" >/dev/null 2>&1 || true
+    # Update/Install management scripts
+    sync_management_scripts_to_dir "$base_dir" "$path"
 
     echo "==> Recursive processing: '$subdir' (Action: $action)..." >&2
     if (
@@ -1809,6 +1818,8 @@ stage_submodule_changes() {
     if [[ "$(basename "$subdir")" != "send_folder_to_github" ]]; then
       protect_path "create_and_push_repo.sh"
       remove_tracked_path "create_and_push_repo.sh"
+      protect_path "verify_parent_topics.sh"
+      remove_tracked_path "verify_parent_topics.sh"
     fi
     protect_path "GITHUB_TOKEN"
     protect_path "GITHUB_TOKEN.txt"
@@ -2304,6 +2315,10 @@ stage_files_excluding_script() {
   if [[ "${ROOT_REPO_NAME:-}" != "send_folder_to_github" && -n "$script_rel" ]]; then
     protect_path "$script_rel"
     remove_tracked_path "$script_rel"
+  fi
+  if [[ "${ROOT_REPO_NAME:-}" != "send_folder_to_github" ]]; then
+    protect_path "verify_parent_topics.sh"
+    remove_tracked_path "verify_parent_topics.sh"
   fi
   if [[ "$SUBCONTAINER_MODE" == "true" ]]; then
     enforce_subcontainer_gitlinks
