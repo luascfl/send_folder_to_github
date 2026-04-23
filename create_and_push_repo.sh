@@ -76,10 +76,87 @@ log_warn() { echo -e "\033[33m[WARN]\033[0m $*" >&2; }
 log_error() { echo -e "\033[31m[ERROR]\033[0m $*" >&2; }
 log_success() { echo -e "\033[32m[SUCCESS]\033[0m $*" >&2; }
 
+subcontainer_dir_has_content() {
+  local dir=$1
+  [[ -d "$dir" ]] || return 1
+  find "$dir" -mindepth 1 -not -name .git -print -quit 2>/dev/null | grep -q . || return 1
+  return 0
+}
+
+github_repo_status_code() {
+  local repo=$1
+  curl -s -o /dev/null -w '%{http_code}' \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    "$GITHUB_API_URL/repos/luascfl/$repo"
+}
+
+reconcile_subcontainer_state() {
+  [[ -f "$SUBCONTAINER_STATE_FILE" || -f .gitmodules ]] || return 0
+  [[ -n "${GITHUB_TOKEN:-}" ]] || return 0
+
+  local -a cleaned=()
+  local -a warn=()
+
+  if [[ -f "$SUBCONTAINER_STATE_FILE" ]]; then
+    while IFS='|' read -r subdir repo; do
+      [[ -z "$subdir" || -z "$repo" ]] && continue
+      local status
+      status=$(github_repo_status_code "$repo")
+      case "$status" in
+        404)
+          if subcontainer_dir_has_content "$subdir"; then
+            warn+=("$subdir: remote 404 mas pasta local tem conteudo; mantendo")
+          else
+            remove_submodule_config "$subdir"
+            if [[ -d "$subdir" ]]; then
+              rm -f "$subdir/.git"
+              rmdir "$subdir" 2>/dev/null || true
+            fi
+            cleaned+=("$subdir (remote 404, local vazio)")
+          fi
+          ;;
+        200|301) ;;
+        *) warn+=("$subdir: HTTP $status; nao vou agir") ;;
+      esac
+    done < "$SUBCONTAINER_STATE_FILE"
+  fi
+
+  if [[ -f .gitmodules ]]; then
+    local name path
+    while IFS= read -r name; do
+      [[ -z "$name" ]] && continue
+      path=$(git config -f .gitmodules --get "submodule.$name.path" 2>/dev/null || true)
+      [[ -z "$path" ]] && continue
+      if subcontainer_dir_has_content "$path"; then
+        continue
+      fi
+      if [[ -f "$SUBCONTAINER_STATE_FILE" ]] && grep -qF "$path|" "$SUBCONTAINER_STATE_FILE"; then
+        continue
+      fi
+      remove_submodule_config "$path"
+      if [[ -d "$path" ]]; then
+        rm -f "$path/.git"
+        rmdir "$path" 2>/dev/null || true
+      fi
+      cleaned+=(".gitmodules orphan: $name")
+    done < <(git config -f .gitmodules --name-only --get-regexp '^submodule\..*\.path$' 2>/dev/null | sed -E 's/^submodule\.(.+)\.path$/\1/')
+  fi
+
+  if (( ${#cleaned[@]} > 0 )); then
+    echo "Reconcile subcontainers removeu:" >&2
+    printf '  - %s\n' "${cleaned[@]}" >&2
+  fi
+  if (( ${#warn[@]} > 0 )); then
+    echo "Reconcile subcontainers aviso:" >&2
+    printf '  - %s\n' "${warn[@]}" >&2
+  fi
+}
+
 perform_subcontainer_push_sequence() {
   local repo_name=$1 remote_url=$2 current_branch=$3 script_rel=$4 with_releases=${5:-false}
 
   SUBCONTAINER_MODE=true
+  reconcile_subcontainer_state
   prepare_subcontainer_plan "$repo_name"
   ensure_remote_repo_exists "$repo_name" "$(repo_visibility_from_folder "$repo_name")"
   ensure_remote "$remote_url"
