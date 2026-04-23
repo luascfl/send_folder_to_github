@@ -1,0 +1,17 @@
+project:
+  name: "send-folder-to-github"
+  scale: SMALL
+  started: "2026-04-22T00:00:00Z"
+  current_phase: E
+
+phases:
+  P:
+    status: completed
+  R:
+    status: completed
+  E:
+    status: in_progress
+  V:
+    status: pending
+  C:
+    status: pending

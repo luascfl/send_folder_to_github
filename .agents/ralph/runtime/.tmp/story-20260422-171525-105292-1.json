@@ -1,0 +1,9 @@
+{
+  "ok": true,
+  "total": 2,
+  "remaining": 2,
+  "quality_gates": [
+    "bash -n create_and_push_repo.sh",
+    "bash -n verify_parent_topics.sh"
+  ]
+}

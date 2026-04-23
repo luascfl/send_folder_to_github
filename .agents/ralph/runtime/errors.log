@@ -1,0 +1,6 @@
+# Error Log
+
+> Failures and repeated issues. Use this to add guardrails.
+
+[2026-04-22 17:22:41] ITERATION 1 command failed (status=141)
+[2026-04-22 17:22:42] ITERATION 1 exited non-zero; review /home/lucas/Downloads/send_folder_to_github/.agents/ralph/runtime/runs/run-20260422-171723-105935-iter-1.log
