@@ -101,6 +101,46 @@ perform_subcontainer_push_sequence() {
   fi
 }
 
+print_usage() {
+  cat <<'EOF'
+Uso: ./create_and_push_repo.sh [acao]
+
+Acoes:
+  push                     push da pasta atual como um unico repo.
+  push-subfolders          trata subpastas como subcontainers/submodulos e faz push.
+                           Executa sincronizacao automatica de parent topic quando
+                           a pasta atual for 'codex*'.
+  push-subfolders-releases igual a push-subfolders, com criacao de release a partir
+                           de APKs presentes nas subpastas.
+  push-recursive           varre subpastas da pasta atual e aplica o fluxo por tipo.
+                           Se houver pastas 'codex*' na varredura, sincroniza parent
+                           topic delas automaticamente ao fim.
+  push-firefox-amo-github  fluxo Firefox AMO + push no GitHub.
+  sync-scripts             rota interna de sincronizacao de scripts.
+  reauth                   atualiza credenciais (GitHub/AMO).
+  -h, --help               mostra esta ajuda.
+
+Comportamento padrao:
+  Sem argumento e em terminal interativo, abre prompt para escolher a acao.
+  Sem argumento e em modo nao interativo, assume 'push'.
+
+Variaveis de ambiente relevantes:
+  GITHUB_TOKEN            token da API GitHub. Usado no push, criacao de repo e na
+                          etapa automatica de parent topic.
+  GITHUB_OWNER            owner GitHub usado na etapa de parent topic (default: luascfl).
+  GITHUB_REMOTE_PROTOCOL  https (default) ou ssh para o remote origin.
+  ALLOW_PULL              '1' libera pull/rebase automatico quando local divergir.
+  AUTO_INSTALL_DEPS       '0' desativa auto instalacao de dependencias.
+  AMO_API_KEY             chave para fluxo Firefox AMO.
+  AMO_API_SECRET          segredo para fluxo Firefox AMO.
+
+Observacao:
+  Parent topic (tag 'parent-<codex>') e aplicado automaticamente nos subrepos
+  mapeados em '.subcontainers' quando a pasta raiz do ciclo comeca com 'codex'.
+  Nao existe acao ou flag dedicada para isso; roda dentro dos fluxos acima.
+EOF
+}
+
 main() {
   local repo_dir repo_name script_rel action current_branch remote_url
   ensure_dependencies
@@ -112,6 +152,12 @@ main() {
   script_rel=$(script_relative_path "$repo_dir")
   
   if [[ $# -gt 0 ]]; then
+    case "$1" in
+      -h|--help|help)
+        print_usage
+        return 0
+        ;;
+    esac
     action=$1
   else
     if [[ -t 0 ]]; then
