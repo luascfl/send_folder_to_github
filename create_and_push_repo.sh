@@ -15,7 +15,7 @@ ROOT_TOKEN_FILE=""
 ALLOW_PULL=${ALLOW_PULL:-0} # Default is fetch-only; set to 1 to allow automatic pulls/rebases
 AUTO_INSTALL_DEPS=${AUTO_INSTALL_DEPS:-1}
 __APT_UPDATED=0
-CUSTOM_IGNORED_REMOTE_REPOS=("cache")
+CUSTOM_IGNORED_REMOTE_REPOS=("cache" "Downloads")
 CENTRAL_CONFIG_DIR="${HOME}/Downloads"
 declare -a DEFAULT_INDEX_EXCLUDES=(
   "node_modules"
@@ -155,6 +155,17 @@ main() {
   ensure_token
   ensure_git_lfs
 
+  case "$action" in
+    push-recursive)
+      push_recursive_all
+      return
+      ;;
+    sync-scripts)
+      sync_scripts_recursively
+      return
+      ;;
+  esac
+
   if ! warn_index_lock; then
     exit 1
   fi
@@ -190,12 +201,6 @@ main() {
     push-subfolders-releases)
       perform_subcontainer_push_sequence "$repo_name" "$remote_url" "$current_branch" "$script_rel" "true"
       ;; 
-    push-recursive)
-      push_recursive_all
-      ;; 
-    sync-scripts)
-      sync_scripts_recursively
-      ;;
     push-firefox-amo-github)
       SUBCONTAINER_MODE=false
       ensure_amo_credentials
