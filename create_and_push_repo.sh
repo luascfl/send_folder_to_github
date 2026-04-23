@@ -1748,6 +1748,25 @@ push_recursive_all() {
   else
     printf '    (none)\n' >&2
   fi
+  # Aggregate root-owned items across processed/failed dirs and emit copy-paste chown.
+  local -a root_owned=()
+  local entry name
+  for entry in "${pushed[@]}" "${failed[@]}"; do
+    name=${entry%% *}
+    while IFS= read -r -d '' p; do
+      root_owned+=("$p")
+    done < <(find "$base_dir/$name" -maxdepth 1 -user root -print0 2>/dev/null)
+  done
+
+  if [[ ${#root_owned[@]} -gt 0 ]]; then
+    printf '\nROOT_OWNED_ITEMS detected. Copie e cole para desbloquear:\n' >&2
+    printf 'sudo chown -R "$USER:$USER"' >&2
+    for p in "${root_owned[@]}"; do
+      printf ' \\\n  %q' "$p" >&2
+    done
+    printf '\n\n' >&2
+  fi
+
   run_parent_topic_verifier_auto "$base_dir"
 }
 
