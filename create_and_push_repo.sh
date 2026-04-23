@@ -1816,6 +1816,10 @@ push_recursive_all() {
     if [[ "${subdir:0:1}" == "." ]]; then
       continue
     fi
+    if remote_should_be_ignored "$subdir"; then
+      ignored+=("$subdir (ignored by policy)")
+      continue
+    fi
     
     # Classify subfolder type; skip dirs without any managed marker
     flavor=$(detect_repo_flavor "$path")
