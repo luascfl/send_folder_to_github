@@ -103,41 +103,20 @@ perform_subcontainer_push_sequence() {
 
 print_usage() {
   cat <<'EOF'
-Uso: ./create_and_push_repo.sh [acao]
+----------------------------------------------------------------
+Create and Push Repo Script
+----------------------------------------------------------------
+This script manages git repositories, handling authentication,
+remote creation, and recursive operations for subfolders.
 
-Acoes:
-  push                     push da pasta atual como um unico repo.
-  push-subfolders          trata subpastas como subcontainers/submodulos e faz push.
-                           Executa sincronizacao automatica de parent topic quando
-                           a pasta atual for 'codex*'.
-  push-subfolders-releases igual a push-subfolders, com criacao de release a partir
-                           de APKs presentes nas subpastas.
-  push-recursive           varre subpastas da pasta atual e aplica o fluxo por tipo.
-                           Se houver pastas 'codex*' na varredura, sincroniza parent
-                           topic delas automaticamente ao fim.
-  push-firefox-amo-github  fluxo Firefox AMO + push no GitHub.
-  sync-scripts             rota interna de sincronizacao de scripts.
-  reauth                   atualiza credenciais (GitHub/AMO).
-  -h, --help               mostra esta ajuda.
-
-Comportamento padrao:
-  Sem argumento e em terminal interativo, abre prompt para escolher a acao.
-  Sem argumento e em modo nao interativo, assume 'push'.
-
-Variaveis de ambiente relevantes:
-  GITHUB_TOKEN            token da API GitHub. Usado no push, criacao de repo e na
-                          etapa automatica de parent topic.
-  GITHUB_OWNER            owner GitHub usado na etapa de parent topic (default: luascfl).
-  GITHUB_REMOTE_PROTOCOL  https (default) ou ssh para o remote origin.
-  ALLOW_PULL              '1' libera pull/rebase automatico quando local divergir.
-  AUTO_INSTALL_DEPS       '0' desativa auto instalacao de dependencias.
-  AMO_API_KEY             chave para fluxo Firefox AMO.
-  AMO_API_SECRET          segredo para fluxo Firefox AMO.
-
-Observacao:
-  Parent topic (tag 'parent-<codex>') e aplicado automaticamente nos subrepos
-  mapeados em '.subcontainers' quando a pasta raiz do ciclo comeca com 'codex'.
-  Nao existe acao ou flag dedicada para isso; roda dentro dos fluxos acima.
+Available Actions:
+  push            : Pushes the current directory as a single repo.
+  push-recursive  : Scans subfolders and pushes them individually,
+                    detecting special types (Codex, Firefox Ext,
+                    Releases) automatically.
+  reauth          : Updates GitHub/AMO credentials.
+  -h, --help      : Shows this help message.
+----------------------------------------------------------------
 EOF
 }
 
