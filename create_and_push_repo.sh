@@ -103,19 +103,19 @@ reconcile_subcontainer_state() {
       local status
       status=$(github_repo_status_code "$repo")
       case "$status" in
-        404)
+        404|301)
           if subcontainer_dir_has_content "$subdir"; then
-            warn+=("$subdir: remote 404 mas pasta local tem conteudo; mantendo")
+            warn+=("$subdir: remote HTTP $status mas pasta local tem conteudo; mantendo")
           else
             remove_submodule_config "$subdir"
             if [[ -d "$subdir" ]]; then
               rm -f "$subdir/.git"
               rmdir "$subdir" 2>/dev/null || true
             fi
-            cleaned+=("$subdir (remote 404, local vazio)")
+            cleaned+=("$subdir (remote HTTP $status, local vazio)")
           fi
           ;;
-        200|301) ;;
+        200) ;;
         *) warn+=("$subdir: HTTP $status; nao vou agir") ;;
       esac
     done < "$SUBCONTAINER_STATE_FILE"
@@ -1771,6 +1771,43 @@ push_recursive_all() {
   local path subdir flavor
 
   base_dir=$(pwd)
+  # When invoked inside a single-repo flavor (codex, releases, firefox), delegate to push.
+  local cwd_flavor
+  cwd_flavor=$(detect_repo_flavor "$base_dir")
+  case "$cwd_flavor" in
+    subcontainer|subcontainer-releases|firefox)
+      echo "Delegating to 'push' for $cwd_flavor flavor at $base_dir" >&2
+      ROOT_REPO_NAME=$(basename "$base_dir")
+      ROOT_REPO_DIR=$base_dir
+      local script_rel
+      script_rel=$(script_relative_path "$base_dir")
+      init_git_repo
+      ensure_root_commit
+      local current_branch remote_url
+      current_branch=$(ensure_main_branch)
+      remote_url=$(resolve_remote_url "$ROOT_REPO_NAME")
+      ROOT_REMOTE_URL=$remote_url
+      if [[ "$cwd_flavor" == "firefox" ]]; then
+        SUBCONTAINER_MODE=false
+        ensure_amo_credentials
+        if ! submit_extension_to_amo; then
+          echo "Aviso: Falha na submissao ao AMO. Continuando com push para GitHub..." >&2
+        fi
+        ensure_remote_repo_exists "$ROOT_REPO_NAME" "$(repo_visibility_from_folder "$ROOT_REPO_NAME")"
+        ensure_remote "$remote_url"
+        sync_with_remote "$current_branch"
+        perform_push "$script_rel" "$current_branch" "$remote_url"
+        ensure_remote "$remote_url"
+      else
+        local with_releases=false
+        [[ "$cwd_flavor" == "subcontainer-releases" ]] && with_releases=true
+        perform_subcontainer_push_sequence "$ROOT_REPO_NAME" "$remote_url" "$current_branch" "$script_rel" "$with_releases"
+      fi
+      return
+      ;;
+  esac
+
+
   echo "==> Starting recursive push for all known types..." >&2
 
   while IFS= read -r -d '' path; do
