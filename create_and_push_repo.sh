@@ -120,6 +120,24 @@ Available Actions:
 EOF
 }
 
+detect_repo_flavor() {
+  local dir=$1 name
+  name=$(basename "$dir")
+  if [[ "$name" == releases* ]]; then
+    echo "subcontainer-releases"
+    return
+  fi
+  if [[ "$name" == codex* ]]; then
+    echo "subcontainer"
+    return
+  fi
+  if [[ -n $(find "$dir" -maxdepth 1 -name "*.xpi" -print -quit 2>/dev/null) ]]; then
+    echo "firefox"
+    return
+  fi
+  echo "plain"
+}
+
 main() {
   local repo_dir repo_name script_rel action current_branch remote_url
   ensure_dependencies
@@ -146,6 +164,14 @@ main() {
     fi
   fi
 
+  case "$action" in
+    push|push-recursive|reauth) ;;
+    *)
+      echo "Unknown action '$action'. Use push, push-recursive, or reauth." >&2
+      exit 1
+      ;;
+  esac
+
   if [[ "$action" == "reauth" ]]; then
     reauth_all_recursively "$repo_dir"
     echo "Lembrete: Para carregar as variáveis no seu ambiente atual, execute com 'source' (ex: source ./create_and_push_repo.sh reauth)." >&2
@@ -158,10 +184,6 @@ main() {
   case "$action" in
     push-recursive)
       push_recursive_all
-      return
-      ;;
-    sync-scripts)
-      sync_scripts_recursively
       return
       ;;
   esac
@@ -186,34 +208,41 @@ main() {
   remote_url=$(resolve_remote_url "$repo_name")
   ROOT_REMOTE_URL="$remote_url"
 
+  local flavor
+  flavor=$(detect_repo_flavor "$repo_dir")
+
   case "$action" in
     push)
-      SUBCONTAINER_MODE=false
-      ensure_remote_repo_exists "$repo_name" "$(repo_visibility_from_folder "$repo_name")"
-      ensure_remote "$remote_url"
-      sync_with_remote "$current_branch"
-      perform_push "$script_rel" "$current_branch" "$remote_url"
-      ensure_remote "$remote_url"
-      ;; 
-    push-subfolders)
-      perform_subcontainer_push_sequence "$repo_name" "$remote_url" "$current_branch" "$script_rel" "false"
-      ;; 
-    push-subfolders-releases)
-      perform_subcontainer_push_sequence "$repo_name" "$remote_url" "$current_branch" "$script_rel" "true"
-      ;; 
-    push-firefox-amo-github)
-      SUBCONTAINER_MODE=false
-      ensure_amo_credentials
-      if ! submit_extension_to_amo; then
-        echo "Aviso: Falha na submissão ao AMO. Continuando com push para GitHub..." >&2
-      fi
-      ensure_remote_repo_exists "$repo_name" "$(repo_visibility_from_folder "$repo_name")"
-      ensure_remote "$remote_url"
-      sync_with_remote "$current_branch"
-      perform_push "$script_rel" "$current_branch" "$remote_url"
-      ensure_remote "$remote_url"
-      ;; 
-    *) 
+      case "$flavor" in
+        subcontainer-releases)
+          perform_subcontainer_push_sequence "$repo_name" "$remote_url" "$current_branch" "$script_rel" "true"
+          ;;
+        subcontainer)
+          perform_subcontainer_push_sequence "$repo_name" "$remote_url" "$current_branch" "$script_rel" "false"
+          ;;
+        firefox)
+          SUBCONTAINER_MODE=false
+          ensure_amo_credentials
+          if ! submit_extension_to_amo; then
+            echo "Aviso: Falha na submissão ao AMO. Continuando com push para GitHub..." >&2
+          fi
+          ensure_remote_repo_exists "$repo_name" "$(repo_visibility_from_folder "$repo_name")"
+          ensure_remote "$remote_url"
+          sync_with_remote "$current_branch"
+          perform_push "$script_rel" "$current_branch" "$remote_url"
+          ensure_remote "$remote_url"
+          ;;
+        *)
+          SUBCONTAINER_MODE=false
+          ensure_remote_repo_exists "$repo_name" "$(repo_visibility_from_folder "$repo_name")"
+          ensure_remote "$remote_url"
+          sync_with_remote "$current_branch"
+          perform_push "$script_rel" "$current_branch" "$remote_url"
+          ensure_remote "$remote_url"
+          ;;
+      esac
+      ;;
+    *)
       echo "Unknown action '$action'." >&2
       exit 1
       ;;
@@ -1023,23 +1052,6 @@ prompt_repo_action() {
     fi
     case "${choice,,}" in
       ""|push) echo "push"; return ;;
-      push-subfolders|push+subfolders|push_subfolders)
-        echo "push-subfolders"
-        return
-      ;;
-      push-subfolders-releases|push_subfolders_releases)
-        echo "push-subfolders-releases"
-        return
-      ;;
-      push-recursive|push_recursive|recursive)
-        echo "push-recursive"
-        return
-        ;;
-      push-firefox-amo-github|push_firefox_amo_github)
-        # Keep hidden but functional if typed manually
-        echo "push-firefox-amo-github"
-        return
-        ;;
       reauth|auth|token)
         echo "reauth"
         return
@@ -1679,7 +1691,7 @@ push_recursive_all() {
   local -a pushed=()
   local -a failed=()
   local -a ignored=()
-  local path subdir action
+  local path subdir flavor
 
   base_dir=$(pwd)
   echo "==> Starting recursive push for all known types..." >&2
@@ -1691,20 +1703,11 @@ push_recursive_all() {
       continue
     fi
     
-    # 1. Determine type/action
-    action=""
-    
-    if [[ "$subdir" == releases* ]]; then
-        action="push-subfolders-releases"
-    elif [[ "$subdir" == codex* ]]; then
-        action="push-subfolders"
-    elif [[ -n $(find "$path" -maxdepth 1 -name "*.xpi" -print -quit) ]]; then
-        action="push-firefox-amo-github"
-    elif [[ -f "$path/create_and_push_repo.sh" ]]; then
-        action="push"
-    else
-        ignored+=("$subdir (not a managed repo)")
-        continue
+    # Classify subfolder type; skip dirs without any managed marker
+    flavor=$(detect_repo_flavor "$path")
+    if [[ "$flavor" == "plain" && ! -f "$path/create_and_push_repo.sh" ]]; then
+      ignored+=("$subdir (not a managed repo)")
+      continue
     fi
     
     propagate_credentials_to_subdir "$path"
@@ -1712,16 +1715,16 @@ push_recursive_all() {
     # Update/Install management scripts
     sync_management_scripts_to_dir "$base_dir" "$path"
 
-    echo "==> Recursive processing: '$subdir' (Action: $action)..." >&2
+    echo "==> Recursive processing: '$subdir' (flavor: $flavor)..." >&2
     if (
       cd "$path" && \
       export AMO_API_KEY="${AMO_API_KEY:-}" && \
       export AMO_API_SECRET="${AMO_API_SECRET:-}" && \
-      ./create_and_push_repo.sh "$action" < /dev/null
+      ./create_and_push_repo.sh push < /dev/null
     ); then
-      pushed+=("$subdir ($action)")
+      pushed+=("$subdir ($flavor)")
     else
-      failed+=("$subdir ($action)")
+      failed+=("$subdir ($flavor)")
     fi
     sleep 2 # Prevent rate-limiting
   done < <(find "$base_dir" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
@@ -2873,7 +2876,7 @@ run_codex_sync() {
     echo "=== Syncing $dir ==="
     if (
       cd "$dir" || exit 1
-      ./create_and_push_repo.sh push-subfolders
+      ./create_and_push_repo.sh push
     ); then
       ((ok++))
       log_codex_sync 0 "$dir"
