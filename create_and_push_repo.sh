@@ -15,6 +15,7 @@ ROOT_TOKEN_FILE=""
 ALLOW_PULL=${ALLOW_PULL:-0} # Default is fetch-only; set to 1 to allow automatic pulls/rebases
 AUTO_INSTALL_DEPS=${AUTO_INSTALL_DEPS:-1}
 __APT_UPDATED=0
+SECRET_FIX_MAX_RETRIES=${SECRET_FIX_MAX_RETRIES:-12}
 CUSTOM_IGNORED_REMOTE_REPOS=("cache" "Downloads")
 CENTRAL_CONFIG_DIR="${HOME}/Downloads"
 declare -a DEFAULT_INDEX_EXCLUDES=(
@@ -2265,8 +2266,12 @@ record_subcontainer_commit() {
 }
 
 push_submodule_with_credentials() {
-  local subdir=$1 branch=${2:-main} force_flag=${3:-} output status
+  local subdir=$1 branch=${2:-main} force_flag=${3:-} retry_depth=${4:-0} output status
   
+  if (( retry_depth >= SECRET_FIX_MAX_RETRIES )); then
+    echo "Reached secret-fix retry limit ($SECRET_FIX_MAX_RETRIES) for submodule '$subdir'. Resolve remaining secrets manually." >&2
+    return 1
+  fi
   # Define push command execution
   local -a push_cmd=(git -C "$subdir" push -u origin "$branch")
   if [[ -n "$force_flag" ]]; then
@@ -2314,17 +2319,17 @@ push_submodule_with_credentials() {
     
     if [[ $secret_status -eq 0 ]]; then
       echo "Retrying submodule push after removing secrets..." >&2
-      push_submodule_with_credentials "$subdir" "$branch"
+      push_submodule_with_credentials "$subdir" "$branch" "$force_flag" "$((retry_depth + 1))"
       return $?
     elif [[ $secret_status -eq 2 ]]; then
       echo "Deep history cleaned. Retrying submodule push with --force..." >&2
-      push_submodule_with_credentials "$subdir" "$branch" "--force"
+      push_submodule_with_credentials "$subdir" "$branch" "--force" "$((retry_depth + 1))"
       return $?
     fi
 
     if handle_large_file_push_rejection "$subdir" "$output"; then
       echo "Retrying submodule push for '$subdir' after enabling Git LFS..." >&2
-      push_submodule_with_credentials "$subdir" "$branch"
+      push_submodule_with_credentials "$subdir" "$branch" "$force_flag" "$((retry_depth + 1))"
       return $?
     fi
   fi
@@ -2405,6 +2410,14 @@ print("\n".join(found))
 PY
 }
 
+collect_history_sensitive_paths() {
+  local repo_path=$1
+  git -C "$repo_path" log --all --name-only --pretty=format: 2>/dev/null \
+    | sed '/^$/d' \
+    | grep -E '(^GITHUB_TOKEN(\.txt)?$|^AMO_API_(KEY|SECRET)(\.txt)?$|^backups/[^/]+/\.(bashrc|bash_profile|zshrc|profile)\.bak$)' \
+    | sort -u || true
+}
+
 handle_push_secrets_rejection() {
   local repo_path=$1 push_output=$2
   if [[ "$push_output" != *"GH013"* ]] && [[ "$push_output" != *"Push cannot contain secrets"* ]]; then
@@ -2413,25 +2426,28 @@ handle_push_secrets_rejection() {
   
   echo "Security violation detected! Attempting automatic fix..." >&2
   
-  # Extract file paths using Python
+  # Extract file paths from push protection output
   local files
   files=$(python3 - "$push_output" <<'PY'
 import sys, re
 text = sys.argv[1]
 found = []
-# Look for "path: filename:line"
-patterns = [r'path:\s*([^:\n]+)(:\d+)?']
 for line in text.splitlines():
-    for pat in patterns:
-        m = re.search(pat, line)
-        if m:
-            path = m.group(1).strip()
-            if path and path not in found:
-                found.append(path)
+    m = re.search(r'path:\s*([^:\n]+)(:\d+)?', line)
+    if m:
+        path = m.group(1).strip()
+        if path and path not in found:
+            found.append(path)
 print("\n".join(found))
 PY
 )
 
+  # Expand with known high-risk history paths so cleanup happens in one pass
+  local history_paths
+  history_paths=$(collect_history_sensitive_paths "$repo_path")
+  if [[ -n "$history_paths" ]]; then
+    files=$(printf "%s\n%s\n" "$files" "$history_paths" | awk 'NF && !seen[$0]++')
+  fi
   if [[ -z "$files" ]]; then
     echo "Could not parse secret file paths from error message." >&2
     return 1
@@ -2754,6 +2770,23 @@ auto_ignore_problematic_files() {
             done
         fi
     done
+
+    local -a shell_backup_paths=(
+        "./backups/*/.bashrc.bak"
+        "./backups/*/.bash_profile.bak"
+        "./backups/*/.zshrc.bak"
+        "./backups/*/.profile.bak"
+    )
+    local shell_path
+    for shell_path in "${shell_backup_paths[@]}"; do
+        if ! grep -Fxq "$shell_path" .gitignore 2>/dev/null; then
+            [[ -s .gitignore && "$(tail -c 1 .gitignore | wc -l)" -eq 0 ]] && echo "" >> .gitignore
+            echo "$shell_path" >> .gitignore
+        fi
+        find . -path "$shell_path" -type f -print0 2>/dev/null | while IFS= read -r -d '' file; do
+            git rm --cached --ignore-unmatch "$file" >/dev/null 2>&1 || true
+        done
+    done
     
     # 3. Handle System Junk & Default Excludes
     local -a all_excludes=("${DEFAULT_INDEX_EXCLUDES[@]}")
@@ -2899,6 +2932,10 @@ ensure_token_gitignore() {
     "GITHUB_TOKEN.txt"
     "AMO_API_KEY.txt"
     "AMO_API_SECRET.txt"
+    "backups/*/.bashrc.bak"
+    "backups/*/.bash_profile.bak"
+    "backups/*/.zshrc.bak"
+    "backups/*/.profile.bak"
     "gemini-gcloud-key.json"
     "gcp-oauth.keys.json"
     "*API*"
@@ -3034,8 +3071,12 @@ run_codex_sync() {
 }
 
 push_with_credentials() {
-  local branch=$1 force_flag=${2:-} output status
+  local branch=$1 force_flag=${2:-} retry_depth=${3:-0} output status
   
+  if (( retry_depth >= SECRET_FIX_MAX_RETRIES )); then
+    echo "Reached secret-fix retry limit ($SECRET_FIX_MAX_RETRIES) for repo '$(pwd)'. Resolve remaining secrets manually." >&2
+    return 1
+  fi
   local -a push_cmd=(git push -u origin "$branch")
   if [[ -n "$force_flag" ]]; then
     push_cmd+=("$force_flag")
@@ -3063,7 +3104,7 @@ push_with_credentials() {
     echo "Push rejected (non-fast-forward)." >&2
     if [[ "${ALLOW_PULL:-0}" == "1" ]]; then
       echo "ALLOW_PULL=1: attempting pull --rebase then retrying push..." >&2
-      if pull_with_credentials "$branch" && push_with_credentials "$branch"; then
+      if pull_with_credentials "$branch" && push_with_credentials "$branch" "$force_flag" "$((retry_depth + 1))"; then
         return 0
       fi
     else
@@ -3077,17 +3118,17 @@ push_with_credentials() {
     
     if [[ $secret_status -eq 0 ]]; then
       echo "Retrying push after removing secrets..." >&2
-      push_with_credentials "$branch"
+      push_with_credentials "$branch" "$force_flag" "$((retry_depth + 1))"
       return $?
     elif [[ $secret_status -eq 2 ]]; then
       echo "Deep history cleaned. Retrying push with --force..." >&2
-      push_with_credentials "$branch" "--force"
+      push_with_credentials "$branch" "--force" "$((retry_depth + 1))"
       return $?
     fi
 
     if handle_large_file_push_rejection "." "$output"; then
       echo "Retrying push after enabling Git LFS for large files..." >&2
-      push_with_credentials "$branch"
+      push_with_credentials "$branch" "$force_flag" "$((retry_depth + 1))"
       return $?
     fi
   fi
