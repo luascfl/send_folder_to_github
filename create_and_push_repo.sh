@@ -2082,7 +2082,7 @@ is_subcontainer_git_repo_ready() {
 repair_submodule_gitdir_if_needed() {
   local subdir=$1 gitfile line raw module_name old_module_path new_module_path
   gitfile="$subdir/.git"
-  [[ -f "$gitfile" ]] || return
+  [[ -f "$gitfile" ]] || return 0
 
   if is_subcontainer_git_repo_ready "$subdir"; then
     return
