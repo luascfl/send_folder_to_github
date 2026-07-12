@@ -215,6 +215,12 @@ detect_repo_flavor() {
   echo "plain"
 }
 
+is_declared_submodule_path() {
+  local path=$1
+  [[ -f .gitmodules ]] || return 1
+  git config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null | awk '{print $2}' | grep -Fxq -- "$path"
+}
+
 main() {
   local repo_dir repo_name script_rel action current_branch remote_url
   ensure_dependencies
@@ -1921,6 +1927,21 @@ prepare_subcontainer_plan() {
       fi
     done
     [[ "$excluded" == "true" ]] && continue
+
+    if remote_should_be_ignored "$path"; then
+      continue
+    fi
+
+    if [[ -n "${previous[$path]+_}" ]] || is_declared_submodule_path "$path"; then
+      subdirs+=("$path")
+      continue
+    fi
+
+    local flavor
+    flavor=$(detect_repo_flavor "$path")
+    if [[ "$flavor" == "plain" && ! -f "$path/create_and_push_repo.sh" ]]; then
+      continue
+    fi
 
     subdirs+=("$path")
   done < <(find . -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null || true)
