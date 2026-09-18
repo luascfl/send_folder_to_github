@@ -21,7 +21,7 @@ CREDENTIALS_DIR=${XDG_CONFIG_HOME:-"$HOME/.config"}/send_folder_to_github
 CENTRAL_GITHUB_TOKEN_FILE="$CREDENTIALS_DIR/GITHUB_TOKEN.txt"
 CENTRAL_AMO_API_KEY_FILE="$CREDENTIALS_DIR/AMO_API_KEY.txt"
 CENTRAL_AMO_API_SECRET_FILE="$CREDENTIALS_DIR/AMO_API_SECRET.txt"
-AUTOMATIONS_HUB_DIR="$HOME/Downloads/automacoes"
+declare -A __HUB_TOPIC_CACHE=()
 CUSTOM_IGNORED_REMOTE_REPOS=("cache" "Downloads")
 declare -a DEFAULT_INDEX_EXCLUDES=(
   "node_modules"
@@ -94,6 +94,33 @@ github_repo_status_code() {
   curl -s -o /dev/null -w '%{http_code}' \
     -H "Authorization: token $GITHUB_TOKEN" \
     "$GITHUB_API_URL/repos/luascfl/$repo"
+}
+
+github_repo_has_hub_topic() {
+  local repo=$1 response status
+  [[ -n "$repo" ]] || return 1
+
+  if [[ -n "${__HUB_TOPIC_CACHE[$repo]+_}" ]]; then
+    [[ "${__HUB_TOPIC_CACHE[$repo]}" == "1" ]]
+    return
+  fi
+  if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+    __HUB_TOPIC_CACHE["$repo"]=0
+    return 1
+  fi
+
+  response=$(mktemp)
+  status=$(curl -sS -o "$response" -w "%{http_code}" \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    "$GITHUB_API_URL/repos/${GITHUB_OWNER:-luascfl}/$repo/topics" || true)
+  if [[ "$status" == "200" ]] && jq -e '.names[]? | select(. == "hub")' "$response" >/dev/null 2>&1; then
+    __HUB_TOPIC_CACHE["$repo"]=1
+  else
+    __HUB_TOPIC_CACHE["$repo"]=0
+  fi
+  rm -f "$response"
+  [[ "${__HUB_TOPIC_CACHE[$repo]}" == "1" ]]
 }
 
 reconcile_subcontainer_state() {
@@ -194,47 +221,32 @@ remote creation, and recursive operations for subfolders.
 
 Available Actions:
   push            : Pushes the current directory as a single repo.
-  push-recursive  : Scans subfolders and pushes them individually,
-                    detecting special types (Codex, Firefox Ext,
-                    Releases) automatically.
+  push-recursive  : Pushes managed subfolders recursively. A GitHub
+                    `hub` topic makes a repository manage its children;
+                    Firefox extensions and Releases are detected automatically.
   reauth          : Updates GitHub/AMO credentials.
   -h, --help      : Shows this help message.
 ----------------------------------------------------------------
 EOF
 }
 
-is_automation_hub() {
-  local dir
-  dir=$(realpath -m "$1")
-  case "$dir" in
-    "$AUTOMATIONS_HUB_DIR"|"$AUTOMATIONS_HUB_DIR"/userscripts|"$AUTOMATIONS_HUB_DIR"/google-apps-script|"$AUTOMATIONS_HUB_DIR"/automa-workflows|"$AUTOMATIONS_HUB_DIR"/extensions)
-      return 0
-      ;;
-  esac
-  return 1
-}
-
 is_managed_recursive_dir() {
   local path=$1 base_dir=$2 flavor
   flavor=$(detect_repo_flavor "$path")
   [[ "$flavor" != "plain" ]] && return 0
-  is_automation_hub "$base_dir" && return 0
+  github_repo_has_hub_topic "$(basename "$base_dir")" && return 0
   [[ -d "$path/.git" || -f "$path/.subcontainers" || -f "$path/.gitmodules" ]]
 }
 
 detect_repo_flavor() {
   local dir=$1 name
   name=$(basename "$dir")
-  if is_automation_hub "$dir"; then
-    echo "subcontainer"
-    return
-  fi
-  if [[ "$name" == releases* ]]; then
-    echo "subcontainer-releases"
-    return
-  fi
-  if [[ "$name" == codex* ]]; then
-    echo "subcontainer"
+  if github_repo_has_hub_topic "$name"; then
+    if [[ "$name" == releases* ]]; then
+      echo "subcontainer-releases"
+    else
+      echo "subcontainer"
+    fi
     return
   fi
   if [[ -n $(find "$dir" -maxdepth 1 -name "*.xpi" -print -quit 2>/dev/null) ]]; then
@@ -1678,8 +1690,8 @@ push_recursive_all() {
   cwd_flavor=$(detect_repo_flavor "$base_dir")
   case "$cwd_flavor" in
     subcontainer|subcontainer-releases|firefox)
-      if is_automation_hub "$base_dir"; then
-        echo "Automation hub detected. Pushing its direct hubs as subcontainers..." >&2
+      if github_repo_has_hub_topic "$ROOT_REPO_NAME"; then
+        echo "Hub detected by GitHub topic. Pushing direct children as subcontainers..." >&2
       else
         echo "Delegating to 'push' for $cwd_flavor flavor at $base_dir" >&2
       fi
@@ -1727,7 +1739,7 @@ push_recursive_all() {
       continue
     fi
     
-    # A managed directory is identified by its type, git state, or an explicit automation hub.
+    # A managed directory is identified by its GitHub hub topic, type, or Git state.
     flavor=$(detect_repo_flavor "$path")
     if ! is_managed_recursive_dir "$path" "$base_dir"; then
       ignored+=("$subdir (not a managed repo)")
@@ -2042,7 +2054,12 @@ ensure_single_subcontainer_ready() {
   ensure_submodule_repo_initialized "$subdir"
   ensure_submodule_branch "$subdir"
   ensure_submodule_remote "$subdir" "$remote_url"
-  commit_and_push_submodule "$subdir"
+  if github_repo_has_hub_topic "$repo_name"; then
+    echo "Recursing into nested hub '$repo_name'..." >&2
+    (cd "$subdir" && "$CANONICAL_SCRIPT" push-recursive)
+  else
+    commit_and_push_submodule "$subdir"
+  fi
   record_subcontainer_commit "$subdir"
   register_submodule_reference "$subdir" "$remote_url"
 }
@@ -2185,12 +2202,12 @@ push_submodule_with_credentials() {
     push_cmd+=("$force_flag")
   fi
 
+  local status=0
   if [[ "${GITHUB_REMOTE_PROTOCOL:-https}" == "https" ]]; then
-    output=$(run_with_https_credentials "${push_cmd[@]}" 2>&1)
+    output=$(run_with_https_credentials "${push_cmd[@]}" 2>&1) || status=$?
   else
-    output=$("${push_cmd[@]}" 2>&1)
+    output=$("${push_cmd[@]}" 2>&1) || status=$?
   fi
-  status=$?
   
   printf "%s\n" "$output"
   
