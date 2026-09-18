@@ -1678,7 +1678,11 @@ push_recursive_all() {
   cwd_flavor=$(detect_repo_flavor "$base_dir")
   case "$cwd_flavor" in
     subcontainer|subcontainer-releases|firefox)
-      echo "Delegating to 'push' for $cwd_flavor flavor at $base_dir" >&2
+      if is_automation_hub "$base_dir"; then
+        echo "Automation hub detected. Pushing its direct hubs as subcontainers..." >&2
+      else
+        echo "Delegating to 'push' for $cwd_flavor flavor at $base_dir" >&2
+      fi
       ROOT_REPO_NAME=$(basename "$base_dir")
       ROOT_REPO_DIR=$base_dir
       local script_rel
