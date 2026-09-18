@@ -15,8 +15,14 @@ ROOT_TOKEN_FILE=""
 ALLOW_PULL=${ALLOW_PULL:-0} # Default is fetch-only; set to 1 to allow automatic pulls/rebases
 AUTO_INSTALL_DEPS=${AUTO_INSTALL_DEPS:-1}
 __APT_UPDATED=0
+SECRET_FIX_MAX_RETRIES=${SECRET_FIX_MAX_RETRIES:-12}
+CANONICAL_SCRIPT=${CREATE_AND_PUSH_REPO_SCRIPT:-"$HOME/Downloads/send_folder_to_github/create_and_push_repo.sh"}
+CREDENTIALS_DIR=${XDG_CONFIG_HOME:-"$HOME/.config"}/send_folder_to_github
+CENTRAL_GITHUB_TOKEN_FILE="$CREDENTIALS_DIR/GITHUB_TOKEN.txt"
+CENTRAL_AMO_API_KEY_FILE="$CREDENTIALS_DIR/AMO_API_KEY.txt"
+CENTRAL_AMO_API_SECRET_FILE="$CREDENTIALS_DIR/AMO_API_SECRET.txt"
+AUTOMATIONS_HUB_DIR="$HOME/Downloads/automacoes"
 CUSTOM_IGNORED_REMOTE_REPOS=("cache" "Downloads")
-CENTRAL_CONFIG_DIR="${HOME}/Downloads"
 declare -a DEFAULT_INDEX_EXCLUDES=(
   "node_modules"
   ".eslintcache"
@@ -197,9 +203,32 @@ Available Actions:
 EOF
 }
 
+is_automation_hub() {
+  local dir
+  dir=$(realpath -m "$1")
+  case "$dir" in
+    "$AUTOMATIONS_HUB_DIR"|"$AUTOMATIONS_HUB_DIR"/userscripts|"$AUTOMATIONS_HUB_DIR"/google-apps-script|"$AUTOMATIONS_HUB_DIR"/automa-workflows|"$AUTOMATIONS_HUB_DIR"/extensions)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+is_managed_recursive_dir() {
+  local path=$1 base_dir=$2 flavor
+  flavor=$(detect_repo_flavor "$path")
+  [[ "$flavor" != "plain" ]] && return 0
+  is_automation_hub "$base_dir" && return 0
+  [[ -d "$path/.git" || -f "$path/.subcontainers" || -f "$path/.gitmodules" ]]
+}
+
 detect_repo_flavor() {
   local dir=$1 name
   name=$(basename "$dir")
+  if is_automation_hub "$dir"; then
+    echo "subcontainer"
+    return
+  fi
   if [[ "$name" == releases* ]]; then
     echo "subcontainer-releases"
     return
@@ -257,7 +286,7 @@ main() {
 
   if [[ "$action" == "reauth" ]]; then
     reauth_all_recursively "$repo_dir"
-    echo "Lembrete: Para carregar as variáveis no seu ambiente atual, execute com 'source' (ex: source ./create_and_push_repo.sh reauth)." >&2
+    echo "Credentials are stored centrally in $CREDENTIALS_DIR." >&2
     return
   fi
 
@@ -469,45 +498,28 @@ ensure_git_lfs() {
   fi
   git lfs install --skip-repo >/dev/null 2>&1 || true
 }
+ensure_credentials_dir() {
+  install -d -m 700 "$CREDENTIALS_DIR"
+}
 
 ensure_token() {
   if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-    ROOT_TOKEN_FILE=$(pwd)/GITHUB_TOKEN.txt
+    ROOT_TOKEN_FILE="$CENTRAL_GITHUB_TOKEN_FILE"
     return
   fi
 
-  local token_file
-  if token_file=$(find_token_file); then
-    if load_token_from_file "$token_file"; then
-      export GITHUB_TOKEN
-      ROOT_TOKEN_FILE="$token_file"
-      return
-    fi
+  if load_token_from_file "$CENTRAL_GITHUB_TOKEN_FILE"; then
+    export GITHUB_TOKEN
+    return
   fi
 
-  log_error "provide GITHUB_TOKEN via environment variable or file."
+  log_error "GitHub token not found at $CENTRAL_GITHUB_TOKEN_FILE. Run '$CANONICAL_SCRIPT reauth'."
   exit 1
-}
-
-find_token_file() {
-  local dir=$PWD candidate
-  while true; do
-    for candidate in "$dir/GITHUB_TOKEN" "$dir/GITHUB_TOKEN.txt"; do
-      if [[ -f "$candidate" ]]; then
-        printf "%s\n" "$candidate"
-        return 0
-      fi
-    done
-    if [[ "$dir" == "/" ]]; then
-      break
-    fi
-    dir=$(dirname "$dir")
-  done
-  return 1
 }
 
 load_token_from_file() {
   local token_file=$1 token
+  [[ -f "$token_file" ]] || return 1
   token=$(python3 - "$token_file" <<'PY'
 import sys
 from pathlib import Path
@@ -529,53 +541,9 @@ PY
   return 1
 }
 
-propagate_credentials_to_subdir() {
-  local subdir=$1
-
-  # GitHub - Propagate to all subrepos
-  local gh_target="$subdir/GITHUB_TOKEN.txt"
-  if [[ -n "$ROOT_TOKEN_FILE" && -f "$ROOT_TOKEN_FILE" ]]; then
-    cp "$ROOT_TOKEN_FILE" "$gh_target"
-  elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
-    printf "%s\n" "$GITHUB_TOKEN" >"$gh_target"
-  fi
-  chmod 600 "$gh_target" 2>/dev/null || true
-
-  # Check if subdir is a Firefox extension project
-  local is_firefox_extension=false
-  if [[ -n $(find "$subdir" -maxdepth 1 -name "manifest*.json" -print -quit) ]] || \
-     [[ -n $(find "$subdir" -maxdepth 1 -name "*.xpi" -print -quit) ]]; then
-    is_firefox_extension=true
-  fi
-
-  if [[ "$is_firefox_extension" == "false" ]]; then
-    return
-  fi
-
-  # AMO Key - Propagate only to extensions
-  local amo_key_target="$subdir/AMO_API_KEY.txt"
-  if [[ -f "AMO_API_KEY.txt" ]]; then
-    cp "AMO_API_KEY.txt" "$amo_key_target"
-    chmod 600 "$amo_key_target" 2>/dev/null || true
-  elif [[ -n "${AMO_API_KEY:-}" ]]; then
-     printf "%s\n" "$AMO_API_KEY" >"$amo_key_target"
-     chmod 600 "$amo_key_target" 2>/dev/null || true
-  fi
-
-  # AMO Secret - Propagate only to extensions
-  local amo_secret_target="$subdir/AMO_API_SECRET.txt"
-  if [[ -f "AMO_API_SECRET.txt" ]]; then
-    cp "AMO_API_SECRET.txt" "$amo_secret_target"
-    chmod 600 "$amo_secret_target" 2>/dev/null || true
-  elif [[ -n "${AMO_API_SECRET:-}" ]]; then
-     printf "%s\n" "$AMO_API_SECRET" >"$amo_secret_target"
-     chmod 600 "$amo_secret_target" 2>/dev/null || true
-  fi
-}
-
 reauth_github_token() {
-  local repo_dir=${1:-$PWD} token target login=""
-  target="$repo_dir/GITHUB_TOKEN.txt"
+  local token login=""
+  local target="$CENTRAL_GITHUB_TOKEN_FILE"
 
   echo "Re-authenticating GitHub token. It will be saved to: $target" >&2
   read -rsp "Enter new GitHub PAT (input hidden, leave blank to skip): " token
@@ -585,16 +553,9 @@ reauth_github_token() {
     return
   fi
 
+  ensure_credentials_dir
   printf "%s\n" "$token" >"$target"
-  chmod 600 "$target" 2>/dev/null || true
-  
-  local central_target="${CENTRAL_CONFIG_DIR}/GITHUB_TOKEN.txt"
-  if [[ "$(realpath "$target")" != "$(realpath "$central_target")" ]]; then
-     cp "$target" "$central_target"
-     chmod 600 "$central_target" 2>/dev/null || true
-     echo "Token backup updated at $central_target" >&2
-  fi
-
+  chmod 600 "$target"
   export GITHUB_TOKEN="$token"
   ROOT_TOKEN_FILE="$target"
 
@@ -635,116 +596,59 @@ PY
 }
 
 reauth_amo_credentials() {
-  local repo_dir=$1 key secret
-  local key_file="$repo_dir/AMO_API_KEY.txt"
-  local secret_file="$repo_dir/AMO_API_SECRET.txt"
-  local central_key="${CENTRAL_CONFIG_DIR}/AMO_API_KEY.txt"
-  local central_secret="${CENTRAL_CONFIG_DIR}/AMO_API_SECRET.txt"
+  local key secret
 
   echo "Updating AMO Credentials..." >&2
   read -rsp "Enter AMO API Key (Issuer): " key
   echo
   if [[ -n "$key" ]]; then
-    printf "%s\n" "$key" >"$key_file"
-    chmod 600 "$key_file" 2>/dev/null || true
-    
-    if [[ "$(realpath "$key_file")" != "$(realpath "$central_key")" ]]; then
-      cp "$key_file" "$central_key"
-      chmod 600 "$central_key" 2>/dev/null || true
-      echo "AMO Key backup updated at $central_key" >&2
-    fi
-    
+    ensure_credentials_dir
+    printf "%s\n" "$key" >"$CENTRAL_AMO_API_KEY_FILE"
+    chmod 600 "$CENTRAL_AMO_API_KEY_FILE"
     export AMO_API_KEY="$key"
-    echo "AMO API Key saved to $key_file" >&2
+    echo "AMO API Key saved to $CENTRAL_AMO_API_KEY_FILE" >&2
   fi
 
   read -rsp "Enter AMO API Secret: " secret
   echo
   if [[ -n "$secret" ]]; then
-    printf "%s\n" "$secret" >"$secret_file"
-    chmod 600 "$secret_file" 2>/dev/null || true
-    
-    if [[ "$(realpath "$secret_file")" != "$(realpath "$central_secret")" ]]; then
-      cp "$secret_file" "$central_secret"
-      chmod 600 "$central_secret" 2>/dev/null || true
-      echo "AMO Secret backup updated at $central_secret" >&2
-    fi
-
+    ensure_credentials_dir
+    printf "%s\n" "$secret" >"$CENTRAL_AMO_API_SECRET_FILE"
+    chmod 600 "$CENTRAL_AMO_API_SECRET_FILE"
     export AMO_API_SECRET="$secret"
-    echo "AMO API Secret saved to $secret_file" >&2
+    echo "AMO API Secret saved to $CENTRAL_AMO_API_SECRET_FILE" >&2
   fi
 }
 
 reauth_all_recursively() {
-  local repo_dir=$1
-  
-  # 1. GitHub
-  reauth_github_token "$repo_dir"
+  reauth_github_token
 
-  # 2. AMO
   echo
   read -rp "Do you want to update Firefox AMO credentials? [y/N] " yesno
   if [[ "$yesno" =~ ^[Yy]$ ]]; then
-    reauth_amo_credentials "$repo_dir"
+    reauth_amo_credentials
   fi
 
-  # 3. Recursion
-  echo
-  echo "Propagating credentials to immediate subdirectories..."
-  local base_dir=$repo_dir
-  local path subdir
-  while IFS= read -r -d '' path; do
-    subdir=${path#"$base_dir"/}
-    [[ -z "$subdir" || "${subdir:0:1}" == "." ]] && continue
-    
-    if [[ -f "$path/create_and_push_repo.sh" ]]; then
-       echo "  -> $subdir"
-       propagate_credentials_to_subdir "$path"
-    fi
-  done < <(find "$base_dir" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
-  echo "Credentials propagation complete."
+  echo "Credentials are centralized in $CREDENTIALS_DIR; no credentials are copied to repositories." >&2
 }
 
 # AMO Credentials ------------------------------------------------------------
 ensure_amo_credentials() {
   local missing_creds=0
 
-  if ! load_secret_into_var AMO_API_KEY AMO_API_KEY AMO_API_KEY.txt; then
-    create_secret_placeholder AMO_API_KEY.txt "chave AMO API Key"
-    log_error "Please define AMO_API_KEY or create AMO_API_KEY.txt."
+  if ! load_secret_into_var AMO_API_KEY "$CENTRAL_AMO_API_KEY_FILE"; then
+    log_error "AMO API key not found at $CENTRAL_AMO_API_KEY_FILE. Run '$CANONICAL_SCRIPT reauth'."
     missing_creds=1
   fi
 
-  if ! load_secret_into_var AMO_API_SECRET AMO_API_SECRET AMO_API_SECRET.txt; then
-    create_secret_placeholder AMO_API_SECRET.txt "chave AMO API Secret"
-    log_error "Please define AMO_API_SECRET or create AMO_API_SECRET.txt."
+  if ! load_secret_into_var AMO_API_SECRET "$CENTRAL_AMO_API_SECRET_FILE"; then
+    log_error "AMO API secret not found at $CENTRAL_AMO_API_SECRET_FILE. Run '$CANONICAL_SCRIPT reauth'."
     missing_creds=1
   fi
 
-  if [[ $missing_creds -ne 0 ]]; then
-    log_info "Tip: generate credentials at https://addons.mozilla.org/developers/addon/api/key and paste the key/secret in the first line of each file."
-    exit 1
-  fi
+  [[ $missing_creds -eq 0 ]] || exit 1
 }
 
-create_secret_placeholder() {
-  local filename=$1
-  local label=$2
-  local amo_url="https://addons.mozilla.org/developers/addon/api/key"
-
-  if [[ -e "$filename" ]]; then
-    return
-  fi
-
-  cat >"$filename" <<EOF
-
-# Cole sua $label na primeira linha deste arquivo.
-# Gere novas credenciais no Portal de Desenvolvedores do Firefox: $amo_url
-EOF
-
-  echo "Arquivo '$filename' criado." >&2
-  echo "Acesse $amo_url para gerar a sua $label e cole o valor na primeira linha de '$filename'." >&2
-}
 
 load_secret_into_var() {
   local var_name=$1
@@ -1517,11 +1421,8 @@ run_parent_topic_verifier_auto() {
     return 0
   fi
 
-  if [[ -z "$token" && -f "$base_dir/GITHUB_TOKEN.txt" ]]; then
-    token=$(tr -d '\r\n' < "$base_dir/GITHUB_TOKEN.txt")
-  fi
-  if [[ -z "$token" && -f "$HOME/Downloads/GITHUB_TOKEN.txt" ]]; then
-    token=$(tr -d '\r\n' < "$HOME/Downloads/GITHUB_TOKEN.txt")
+  if [[ -z "$token" && -f "$CENTRAL_GITHUB_TOKEN_FILE" ]]; then
+    token=$(tr -d '\r\n' < "$CENTRAL_GITHUB_TOKEN_FILE")
   fi
   if [[ -z "$token" ]]; then
     echo "Aviso: sem GITHUB_TOKEN, etapa automática de parent topics foi pulada." >&2
@@ -1762,11 +1663,6 @@ perform_push() {
   fi
 }
 
-sync_management_scripts_to_dir() {
-  local source_dir=$1 target_dir=$2
-  cp "$source_dir/create_and_push_repo.sh" "$target_dir/create_and_push_repo.sh"
-  chmod +x "$target_dir/create_and_push_repo.sh" >/dev/null 2>&1 || true
-}
 
 
 push_recursive_all() {
@@ -1827,24 +1723,17 @@ push_recursive_all() {
       continue
     fi
     
-    # Classify subfolder type; skip dirs without any managed marker
+    # A managed directory is identified by its type, git state, or an explicit automation hub.
     flavor=$(detect_repo_flavor "$path")
-    if [[ "$flavor" == "plain" && ! -f "$path/create_and_push_repo.sh" ]]; then
+    if ! is_managed_recursive_dir "$path" "$base_dir"; then
       ignored+=("$subdir (not a managed repo)")
       continue
     fi
-    
-    propagate_credentials_to_subdir "$path"
-    
-    # Update/Install management scripts
-    sync_management_scripts_to_dir "$base_dir" "$path"
 
     echo "==> Recursive processing: '$subdir' (flavor: $flavor)..." >&2
     if (
       cd "$path" && \
-      export AMO_API_KEY="${AMO_API_KEY:-}" && \
-      export AMO_API_SECRET="${AMO_API_SECRET:-}" && \
-      ./create_and_push_repo.sh push < /dev/null
+      "$CANONICAL_SCRIPT" push < /dev/null
     ); then
       pushed+=("$subdir ($flavor)")
     else
@@ -1937,9 +1826,7 @@ prepare_subcontainer_plan() {
       continue
     fi
 
-    local flavor
-    flavor=$(detect_repo_flavor "$path")
-    if [[ "$flavor" == "plain" && ! -f "$path/create_and_push_repo.sh" ]]; then
+    if ! is_managed_recursive_dir "$path" "$PWD"; then
       continue
     fi
 
@@ -3034,7 +2921,7 @@ run_codex_sync() {
     echo "=== Syncing $dir ==="
     if (
       cd "$dir" || exit 1
-      ./create_and_push_repo.sh push
+      "$CANONICAL_SCRIPT" push
     ); then
       ((ok++))
       log_codex_sync 0 "$dir"
