@@ -186,7 +186,7 @@ reconcile_subcontainer_state() {
 }
 
 perform_subcontainer_push_sequence() {
-  local repo_name=$1 remote_url=$2 current_branch=$3 script_rel=$4 with_releases=${5:-false}
+  local repo_name=$1 remote_url=$2 current_branch=$3 script_rel=$4
 
   SUBCONTAINER_MODE=true
   reconcile_subcontainer_state
@@ -195,18 +195,14 @@ perform_subcontainer_push_sequence() {
   ensure_remote "$remote_url"
   sync_with_remote "$current_branch"
 
-  if [[ "$with_releases" == "true" ]]; then
-      ensure_subcontainers_ready_with_releases
-  else
-      ensure_subcontainers_ready
-  fi
+  ensure_subcontainers_ready
 
   perform_push "$script_rel" "$current_branch" "$remote_url"
   ensure_remote "$remote_url"
   clear_removed_subcontainers
   run_parent_topic_verifier_auto "$ROOT_REPO_DIR"
 
-  if [[ "$with_releases" == "false" ]] && should_run_global_codex_sync; then
+  if should_run_global_codex_sync; then
     run_codex_sync
   fi
 }
@@ -223,7 +219,7 @@ Available Actions:
   push            : Pushes the current directory as a single repo.
   push-recursive  : Pushes managed subfolders recursively. A GitHub
                     `hub` topic makes a repository manage its children;
-                    Firefox extensions and Releases are detected automatically.
+                    Firefox extensions are detected automatically.
   reauth          : Updates GitHub/AMO credentials.
   -h, --help      : Shows this help message.
 ----------------------------------------------------------------
@@ -242,11 +238,7 @@ detect_repo_flavor() {
   local dir=$1 name
   name=$(basename "$dir")
   if github_repo_has_hub_topic "$name"; then
-    if [[ "$name" == releases* ]]; then
-      echo "subcontainer-releases"
-    else
-      echo "subcontainer"
-    fi
+    echo "subcontainer"
     return
   fi
   if [[ -n $(find "$dir" -maxdepth 1 -name "*.xpi" -print -quit 2>/dev/null) ]]; then
@@ -338,11 +330,8 @@ main() {
   case "$action" in
     push)
       case "$flavor" in
-        subcontainer-releases)
-          perform_subcontainer_push_sequence "$repo_name" "$remote_url" "$current_branch" "$script_rel" "true"
-          ;;
         subcontainer)
-          perform_subcontainer_push_sequence "$repo_name" "$remote_url" "$current_branch" "$script_rel" "false"
+          perform_subcontainer_push_sequence "$repo_name" "$remote_url" "$current_branch" "$script_rel"
           ;;
         firefox)
           SUBCONTAINER_MODE=false
@@ -1039,9 +1028,7 @@ prompt_repo_action() {
   echo "" >&2
   echo "Available Actions:" >&2
   echo "  push            : Pushes the current directory as a single repo." >&2
-  echo "  push-recursive  : Scans subfolders and pushes them individually," >&2
-  echo "                    detecting special types (Codex, Firefox Ext," >&2
-  echo "                    Releases) automatically." >&2
+  echo "  push-recursive  : Pushes managed subfolders recursively; GitHub `hub` topics define containers." >&2
   echo "  reauth          : Updates GitHub/AMO credentials." >&2
   echo "----------------------------------------------------------------" >&2
   
@@ -1689,7 +1676,7 @@ push_recursive_all() {
   local cwd_flavor
   cwd_flavor=$(detect_repo_flavor "$base_dir")
   case "$cwd_flavor" in
-    subcontainer|subcontainer-releases|firefox)
+    subcontainer|firefox)
       if github_repo_has_hub_topic "$ROOT_REPO_NAME"; then
         echo "Hub detected by GitHub topic. Pushing direct children as subcontainers..." >&2
       else
@@ -1717,9 +1704,7 @@ push_recursive_all() {
         perform_push "$script_rel" "$current_branch" "$remote_url"
         ensure_remote "$remote_url"
       else
-        local with_releases=false
-        [[ "$cwd_flavor" == "subcontainer-releases" ]] && with_releases=true
-        perform_subcontainer_push_sequence "$ROOT_REPO_NAME" "$remote_url" "$current_branch" "$script_rel" "$with_releases"
+        perform_subcontainer_push_sequence "$ROOT_REPO_NAME" "$remote_url" "$current_branch" "$script_rel"
       fi
       return
       ;;
@@ -1893,106 +1878,6 @@ ensure_subcontainers_ready() {
   done
 }
 
-ensure_subcontainers_ready_with_releases() {
-  if [[ ${#__SUBCONTAINERS_TO_PUSH[@]} -eq 0 ]]; then
-    echo "No subfolders detected to manage as submodules." >&2
-    return
-  fi
-
-  local entry subdir repo visibility
-  for entry in "${__SUBCONTAINERS_TO_PUSH[@]}"; do
-    IFS="|" read -r subdir repo visibility <<<"$entry"
-    ensure_single_subcontainer_ready "$subdir" "$repo" "$visibility"
-    create_release_for_subdir "$subdir" "$repo"
-  done
-}
-
-create_release_for_subdir() {
-  local subdir=$1 repo_name=$2
-  
-  # Find APK file
-  local apk_file
-  apk_file=$(find "$subdir" -maxdepth 1 -name "*.apk" -print -quit)
-  
-  if [[ -z "$apk_file" ]]; then
-    echo "No APK found in $subdir, skipping release creation." >&2
-    return
-  fi
-  
-  local filename
-  filename=$(basename "$apk_file")
-  
-  # Extract version from filename (e.g., AppName_v1.2.3.apk -> v1.2.3)
-  local version
-  if [[ "$filename" =~ v([0-9]+\.[0-9]+(\.[0-9]+)?) ]]; then
-    version="v${BASH_REMATCH[1]}"
-  else
-    # Fallback to timestamp if no version found
-    version="release-$(date +%Y%m%d-%H%M%S)"
-  fi
-  
-  echo "Verifying release $version for $repo_name..." >&2
-  
-  # Create tag
-  git -C "$subdir" tag -a "$version" -m "Release $version" 2>/dev/null || true
-  
-  # Push tag
-  if [[ "${GITHUB_REMOTE_PROTOCOL:-https}" == "https" ]]; then
-    run_with_https_credentials git -C "$subdir" push origin "$version" >/dev/null 2>&1 || true
-  else
-    git -C "$subdir" push origin "$version" >/dev/null 2>&1 || true
-  fi
-  
-  # Create Release via API using Python
-  python3 - "$repo_name" "$version" "$apk_file" "$GITHUB_TOKEN" <<'PY'
-import sys, requests, os
-
-repo, tag, apk_path, token = sys.argv[1:]
-filename = os.path.basename(apk_path)
-headers = {'Authorization': f'token {token}', 'Accept': 'application/vnd.github.v3+json'}
-
-# 1. Get or Create Release
-url = f'https://api.github.com/repos/luascfl/{repo}/releases/tags/{tag}'
-r = requests.get(url, headers=headers)
-
-if r.status_code == 404:
-    print(f"Creating new release for {tag}...")
-    url_create = f'https://api.github.com/repos/luascfl/{repo}/releases'
-    data = {'tag_name': tag, 'name': f'Release {tag}', 'body': 'Automated release', 'draft': False, 'prerelease': False}
-    r = requests.post(url_create, headers=headers, json=data)
-    if r.status_code != 201:
-        print(f"Error creating release: {r.text}")
-        sys.exit(1)
-    release = r.json()
-else:
-    # Release exists, silently proceed
-    release = r.json()
-
-# 2. Upload Asset
-upload_url = release['upload_url'].replace('{?name,label}', '')
-existing_assets = [a['name'] for a in release.get('assets', [])]
-
-if filename in existing_assets:
-    print(f"Asset {filename} already present.")
-elif os.path.exists(apk_path):
-    print(f"Uploading {filename}...")
-    with open(apk_path, 'rb') as f:
-        data = f.read()
-    
-    headers_upload = headers.copy()
-    headers_upload['Content-Type'] = 'application/vnd.android.package-archive'
-    
-    r_up = requests.post(f'{upload_url}?name={filename}', headers=headers_upload, data=data)
-    if r_up.status_code == 201:
-        print(f"Success! Download link: {r_up.json().get('browser_download_url')}")
-    elif r_up.status_code == 422:
-        print("Asset already uploaded.")
-    else:
-        print(f"Upload failed: {r_up.text}")
-else:
-    print(f"File not found: {apk_path}")
-PY
-}
 
 is_subcontainer_git_repo_ready() {
   local subdir=$1 toplevel subdir_real top_real
