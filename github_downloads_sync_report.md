@@ -79,7 +79,7 @@
 | `WebcamCircle` | Only on GitHub | — | — |
 | `wingetupgradeall` | Only on GitHub | — | powershell, winget |
 | `x-auto-scroll-and-like` | Only on GitHub | — | tampermonkey, twitter, userscript |
-| `zotero-plugins-6-0-36-or-7` | Only on GitHub | — | parent-codex-luascfl-zotero |
+| `Zotero-plugins-6.0.36-or-7` | Only on GitHub | — | — |
 
 ## Downloads-only Git worktrees
 
