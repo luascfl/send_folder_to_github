@@ -42,3 +42,8 @@
 - Filho ausente declarado em `.gitmodules` entra por `submodule update --init` e volta para o branch quando e fast-forward; senao e clonado na pasta do hub.
 - `PULL_DRY_RUN=1` mostra o plano sem alterar nada.
 - Correcoes do pull-recursive: o destino esperado (`<hub>/<filho>/.git`) vale antes de qualquer copia achada em outro lugar, e o scan guarda o caminho mais raso por repo; o `.subcontainers` de cada hub e lido pela API (mais a copia local) antes da fase 1, entao filhos de hubs nao `codex_*` e hubs aninhados nunca viram clone de nivel superior; fetch, clone e leitura do `.subcontainers` repetem ate 3 vezes em erro de rede.
+
+## token unico 2026-10-11
+- O token do GitHub existe so em `~/Downloads/send_folder_to_github/GITHUB_TOKEN.txt` (modo 600, ignorado pelo Git). `CENTRAL_GITHUB_TOKEN_FILE` = pasta do `CANONICAL_SCRIPT` + `GITHUB_TOKEN.txt` (override: `GITHUB_TOKEN_FILE`); `reauth` grava nesse arquivo. Credenciais do AMO continuam em `~/.config/send_folder_to_github/`.
+- Removidas as copias (31 arquivos): `~/.config/send_folder_to_github/GITHUB_TOKEN.txt`, 18 dentro de repos de `~/Downloads`, 12 na lixeira; e o `~/.git-credentials`, que guardava um segundo token valido de escopo menor. O `git` https agora usa `credential.https://github.com.helper` global, que le o arquivo unico.
+- Cuidado: este repo e publico. O arquivo e ignorado pelo `.gitignore` e filtrado pelo script (`purge_sensitive_paths_from_index`), e a varredura de segredo cobre `ghp_`. Nao use `git add -f`.
