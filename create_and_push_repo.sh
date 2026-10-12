@@ -67,7 +67,7 @@ for entry in "${DEFAULT_INDEX_EXCLUDES[@]}"; do
   fi
   add_ignored_remote_repo "$sanitized"
 done
-declare -a SENSITIVE_PATHS=("GITHUB_TOKEN" "GITHUB_TOKEN.txt" "AMO_API_KEY.txt" "AMO_API_SECRET.txt" "gcp-oauth.keys.json" "gemini-gcloud-key.json" "AMO_API_KEY" "AMO_API_SECRET" ".env" "*.env" ".env.*")
+declare -a SENSITIVE_PATHS=("GITHUB_TOKEN" "GITHUB_TOKEN.txt" "AMO_API_KEY.txt" "AMO_API_SECRET.txt" "gcp-oauth.keys.json" "gemini-gcloud-key.json" "AMO_API_KEY" "AMO_API_SECRET" ".env" "*.env" ".env.*" "*.key" "*.pfx" "*.ppk")
 SUBCONTAINER_STATE_FILE=".subcontainers"
 SUBCONTAINER_MODE=false
 ROOT_REMOTE_URL=""
@@ -75,6 +75,102 @@ GITHUB_API_URL="https://api.github.com"
 ROOT_REPO_NAME=""
 ROOT_REPO_DIR=""
 trap '__restore_all_backups; restore_root_remote' EXIT INT TERM
+
+# Safety defaults -------------------------------------------------------------
+ALLOW_REMOTE_DELETE=${ALLOW_REMOTE_DELETE:-0}   # 1 lets 'push' delete a GitHub repo whose folder name is on the ignore list
+SECRET_SCAN=${SECRET_SCAN:-1}                   # 0 disables the pre-commit scan for secret-looking content
+CURL_CONNECT_TIMEOUT=${CURL_CONNECT_TIMEOUT:-15}
+CURL_MAX_TIME=${CURL_MAX_TIME:-120}
+__SECRET_FIX_ATTEMPTS=0                         # shared budget for automatic secret/LFS fixes (SECRET_FIX_MAX_RETRIES)
+__FORCE_LEASE_SHA=""                            # remote tip recorded before a history rewrite, used by --force-with-lease
+
+# curl wrapper: adds timeouts and keeps the Authorization header out of the process list.
+curl() {
+  local -a args=()
+  local auth=""
+  while (($#)); do
+    if [[ "$1" == "-H" && "${2:-}" == Authorization:* ]]; then
+      auth=$2
+      shift 2
+      continue
+    fi
+    args+=("$1")
+    shift
+  done
+  if [[ -n "$auth" ]]; then
+    auth=${auth//\\/\\\\}
+    auth=${auth//\"/\\\"}
+    command curl --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
+      -K <(printf 'header = "%s"\n' "$auth") "${args[@]}"
+  else
+    command curl --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" "${args[@]}"
+  fi
+}
+
+# Unstage files whose staged content looks like a credential; the rest of the commit proceeds.
+scan_staged_for_secrets() {
+  local repo_path=${1:-.} file kinds
+  [[ "$SECRET_SCAN" == "1" ]] || return 0
+  while IFS=$'\t' read -r -d '' file kinds; do
+    [[ -z "$file" ]] && continue
+    if git -C "$repo_path" cat-file -e "HEAD:$file" 2>/dev/null; then
+      git -C "$repo_path" reset -q -- "$file" >/dev/null 2>&1 || true
+    else
+      git -C "$repo_path" rm --cached -q --ignore-unmatch -- "$file" >/dev/null 2>&1 || true
+    fi
+    echo "[Secret-Scan] '$file' parece conter segredo ($kinds); deixado fora deste commit. Remova o segredo do arquivo ou ignore-o." >&2
+  done < <(git -C "$repo_path" diff --cached --name-only --diff-filter=AM -z | python3 -c '
+import re, subprocess, sys
+repo = sys.argv[1]
+patterns = [
+    ("openrouter", r"sk-or-v1-[0-9a-f]{20,}"),
+    ("google_api_key", r"AIza[0-9A-Za-z_\-]{30,}"),
+    ("google_oauth_secret", r"GOCSPX-[A-Za-z0-9_\-]{20,}"),
+    ("google_refresh_token", r"\b1//0[A-Za-z0-9_\-]{40,}"),
+    ("groq", r"gsk_[A-Za-z0-9]{30,}"),
+    ("github_token", r"gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}"),
+    ("slack", r"xox[bp]-[0-9A-Za-z\-]{20,}"),
+    ("aws", r"AKIA[0-9A-Z]{16}"),
+    ("private_key", r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    ("client_secret", r"client_secret[\"\x27]?\s*[=:]\s*[\"\x27][A-Za-z0-9_\-]{10,}"),
+]
+rx = [(name, re.compile(p)) for name, p in patterns]
+names = [n for n in sys.stdin.buffer.read().decode("utf-8", "surrogateescape").split("\0") if n]
+for name in names:
+    r = subprocess.run(["git", "-C", repo, "show", ":" + name], capture_output=True)
+    if r.returncode != 0 or len(r.stdout) > 2000000 or b"\0" in r.stdout[:4096]:
+        continue
+    text = r.stdout.decode("utf-8", "ignore")
+    hits = [n for n, p in rx if p.search(text)]
+    if hits:
+        sys.stdout.buffer.write(name.encode("utf-8", "surrogateescape") + b"\t" + ",".join(hits).encode() + b"\0")
+' "$repo_path")
+}
+
+# Move unusable git metadata aside instead of deleting it.
+quarantine_gitdir() {
+  local target=$1 gitdir backup_root
+  [[ -e "$target/.git" ]] || return 0
+  if [[ -d "$target/.git" ]]; then
+    gitdir=$(git rev-parse --git-dir 2>/dev/null || echo .git)
+    backup_root="$gitdir/broken-gitdirs"
+    mkdir -p "$backup_root"
+    mv -- "$target/.git" "$backup_root/$(basename "$target")-$(date +%s)"
+    echo "Git metadata of '$target' moved to '$backup_root' (nothing was deleted)." >&2
+  else
+    rm -f -- "$target/.git"
+  fi
+}
+
+# Bounds the recursive "fix and retry" loops. Returns 0 when the budget is exhausted.
+secret_fix_budget_exhausted() {
+  __SECRET_FIX_ATTEMPTS=$((__SECRET_FIX_ATTEMPTS + 1))
+  if (( __SECRET_FIX_ATTEMPTS > SECRET_FIX_MAX_RETRIES )); then
+    echo "Automatic fix attempts exceeded SECRET_FIX_MAX_RETRIES=$SECRET_FIX_MAX_RETRIES; stopping." >&2
+    return 0
+  fi
+  return 1
+}
 
 # Logging --------------------------------------------------------------------
 log_info() { echo -e "\033[34m[INFO]\033[0m $*" >&2; }
@@ -222,6 +318,16 @@ Available Actions:
                     Firefox extensions are detected automatically.
   reauth          : Updates GitHub/AMO credentials.
   -h, --help      : Shows this help message.
+
+Safety switches (environment variables):
+  SECRET_SCAN=1            : Files whose staged content looks like a credential are
+                             left out of the commit (set 0 to disable).
+  ALLOW_REMOTE_DELETE=0    : Never deletes a GitHub repo for ignored folder names
+                             (set 1 to allow).
+  ALLOW_PULL=0             : Fetch only; set 1 to allow pull --rebase.
+  SECRET_FIX_MAX_RETRIES=12: Cap on automatic secret/LFS fix-and-retry cycles.
+  Rewritten history is always backed up as .git/pre-secret-cleanup-*.bundle and
+  force-pushed with --force-with-lease.
 ----------------------------------------------------------------
 EOF
 }
@@ -365,8 +471,8 @@ main() {
 # Dependency / token helpers -------------------------------------------------
 ensure_dependencies() {
   local dep missing=()
-  for dep in git curl jq python3 git-lfs web-ext; do
-    if ! command -v "$dep" >/dev/null 2>&1; then
+  for dep in git curl jq python3 git-lfs; do
+    if ! type -P "$dep" >/dev/null 2>&1; then
       missing+=("$dep")
     fi
   done
@@ -693,6 +799,14 @@ PY
 
 # AMO Submission -------------------------------------------------------------
 submit_extension_to_amo() {
+  if ! command -v web-ext >/dev/null 2>&1; then
+    if [[ "$AUTO_INSTALL_DEPS" == "1" ]] && install_dependency web-ext && command -v web-ext >/dev/null 2>&1; then
+      :
+    else
+      log_error "dependency 'web-ext' was not found in PATH (needed only for Firefox AMO submission)."
+      return 1
+    fi
+  fi
   local channel=${AMO_CHANNEL:-listed}
   ensure_webext_ignore
 
@@ -1063,7 +1177,7 @@ warn_root_owned() {
   for p in "${root_items[@]}"; do
     printf '  %s\n' "$p" >&2
   done
-  printf 'Execute o sudo chown -R lucas:lucas %s\n' "${root_items[*]}" >&2
+  printf 'Execute o sudo chown -R %s:%s %s\n' "${USER:-$(id -un)}" "${USER:-$(id -un)}" "${root_items[*]}" >&2
   return 1
 }
 
@@ -1212,6 +1326,10 @@ remote_should_be_ignored() {
 
 delete_remote_repo() {
   local repo_name=$1 response status curl_exit
+  if [[ "$ALLOW_REMOTE_DELETE" != "1" ]]; then
+    echo "Remote 'luascfl/$repo_name' matches the ignore list; NOT deleting it (set ALLOW_REMOTE_DELETE=1 to allow remote deletion)." >&2
+    return 0
+  fi
   response=$(mktemp)
   set +e
   status=$(curl -sS -w "%{http_code}" -o "$response" \
@@ -1955,7 +2073,7 @@ ensure_submodule_repo_initialized() {
   if is_subcontainer_git_repo_ready "$subdir"; then
     return
   fi
-  rm -rf "$subdir/.git"
+  quarantine_gitdir "$subdir"
   git -C "$subdir" init >/dev/null
   if ! is_subcontainer_git_repo_ready "$subdir"; then
     echo "Failed to initialize isolated git repo for '$subdir'." >&2
@@ -2004,6 +2122,7 @@ stage_submodule_changes() {
     git add --all
     remove_paths_from_index "${DEFAULT_INDEX_EXCLUDES[@]}"
     purge_sensitive_paths_from_index "."
+    scan_staged_for_secrets "."
     if [[ "$(basename "$subdir")" != "send_folder_to_github" ]]; then
       protect_path "create_and_push_repo.sh"
       remove_tracked_path "create_and_push_repo.sh"
@@ -2028,24 +2147,20 @@ commit_and_push_submodule() {
 
   # Sync before push to avoid non-fast-forward errors
   if git -C "$subdir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
-      # Only pull if remote is configured
-      run_git_pull_command_submodule "$subdir" "main" >/dev/null 2>&1 || true
+      # Only pull if remote is configured; never leave the submodule in the middle of a rebase
+      if ! run_git_pull_command_submodule "$subdir" "main" >/dev/null 2>&1; then
+        git -C "$subdir" rebase --abort >/dev/null 2>&1 || true
+        echo "Warning: could not rebase '$subdir' onto its remote; local state kept, push may be rejected." >&2
+      fi
   fi
 
   push_submodule_with_credentials "$subdir"
 }
 
 commit_submodule_safely() {
-  local subdir=$1 has_upstream=1
-  if ! git -C "$subdir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
-    has_upstream=0
-  fi
-
-  if git -C "$subdir" rev-parse --verify HEAD >/dev/null 2>&1 && [[ $has_upstream -eq 0 ]]; then
-    git -C "$subdir" commit --amend --no-edit
-  else
-    git -C "$subdir" commit -m "push"
-  fi
+  local subdir=$1
+  # Always a new commit: amending could rewrite a commit that is already on the remote.
+  git -C "$subdir" commit -m "chore: sync local state"
 }
 
 ensure_submodule_initial_commit() {
@@ -2084,7 +2199,7 @@ push_submodule_with_credentials() {
   # Define push command execution
   local -a push_cmd=(git -C "$subdir" push -u origin "$branch")
   if [[ -n "$force_flag" ]]; then
-    push_cmd+=("$force_flag")
+    push_cmd+=("--force-with-lease=refs/heads/${branch}:${__FORCE_LEASE_SHA:-}")
   fi
 
   local status=0
@@ -2131,8 +2246,8 @@ push_submodule_with_credentials() {
       push_submodule_with_credentials "$subdir" "$branch"
       return $?
     elif [[ $secret_status -eq 2 ]]; then
-      echo "Deep history cleaned. Retrying submodule push with --force..." >&2
-      push_submodule_with_credentials "$subdir" "$branch" "--force"
+      echo "Deep history cleaned. Retrying submodule push with --force-with-lease..." >&2
+      push_submodule_with_credentials "$subdir" "$branch" "--force-with-lease"
       return $?
     fi
 
@@ -2150,6 +2265,9 @@ handle_large_file_push_rejection() {
   local -a files=()
   mapfile -t files < <(extract_large_file_paths "$push_output")
   if [[ ${#files[@]} -eq 0 ]]; then
+    return 1
+  fi
+  if secret_fix_budget_exhausted; then
     return 1
   fi
   echo "Push rejected: files exceed GitHub's 100 MB limit. Configuring Git LFS for: ${files[*]}" >&2
@@ -2222,6 +2340,9 @@ PY
 handle_push_secrets_rejection() {
   local repo_path=$1 push_output=$2
   if [[ "$push_output" != *"GH013"* ]] && [[ "$push_output" != *"Push cannot contain secrets"* ]]; then
+    return 1
+  fi
+  if secret_fix_budget_exhausted; then
     return 1
   fi
   
@@ -2311,8 +2432,18 @@ PY
 
       echo "Rewriting history to remove: $git_rm_args" >&2
       echo "Warning: This operation rewrites commit history (git filter-branch)." >&2
+      local lease_branch backup_bundle
+      lease_branch=$(git -C "$repo_path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)
+      __FORCE_LEASE_SHA=$(git -C "$repo_path" rev-parse --verify -q "refs/remotes/origin/$lease_branch" 2>/dev/null || true)
+      backup_bundle="$(git -C "$repo_path" rev-parse --absolute-git-dir)/pre-secret-cleanup-$(date +%s).bundle"
+      if git -C "$repo_path" bundle create "$backup_bundle" --all >/dev/null 2>&1; then
+        echo "Backup of the pre-rewrite history saved at: $backup_bundle" >&2
+      else
+        echo "Could not create a backup bundle; refusing to rewrite history." >&2
+        return 1
+      fi
 
-      if git -C "$repo_path" filter-branch --force --index-filter \
+      if FILTER_BRANCH_SQUELCH_WARNING=1 git -C "$repo_path" filter-branch --force --index-filter \
          "git rm --cached --ignore-unmatch $git_rm_args" \
          --prune-empty --tag-name-filter cat -- --all >/dev/null 2>&1; then
 
@@ -2499,6 +2630,7 @@ stage_files_excluding_script() {
   git add --all
   remove_paths_from_index "${DEFAULT_INDEX_EXCLUDES[@]}"
   purge_sensitive_paths_from_index "."
+  scan_staged_for_secrets "."
   if [[ "${ROOT_REPO_NAME:-}" != "send_folder_to_github" && -n "$script_rel" ]]; then
     protect_path "$script_rel"
     remove_tracked_path "$script_rel"
@@ -2547,6 +2679,9 @@ auto_ignore_problematic_files() {
         "id_dsa"
         "*.keystore"
         "*.jks"
+        "*.key"
+        "*.pfx"
+        "*.ppk"
     )
 
     local pattern found_files
@@ -2607,7 +2742,7 @@ ensure_submodules_populated() {
   for target in "${cleanup_targets[@]}"; do
       if [[ -e "$target/.git" ]]; then
           echo "Removing invalid git metadata from ignored directory '$target'..." >&2
-          rm -rf "$target/.git"
+          quarantine_gitdir "$target"
       fi
   done
 
@@ -2681,22 +2816,17 @@ ensure_lfs_for_large_files() {
 }
 
 cleanup_local_backup_artifacts() {
-  local -a backups=()
-  while IFS= read -r -d '' path; do
-    path=${path#./}
-    backups+=("$path")
-  done < <(find . -path ./.git -prune -o -name "*.local-backup-*" -print0 2>/dev/null || true)
-
-  if [[ ${#backups[@]} -eq 0 ]]; then
-    return
+  # '*.local-backup-*' files hold the only copy of local edits when a previous run was interrupted.
+  # Keep them on disk and out of commits instead of deleting them.
+  [[ -n "$(find . -path ./.git -prune -o -name '*.local-backup-*' -print -quit 2>/dev/null)" ]] || return 0
+  local exclude_file
+  exclude_file=$(git rev-parse --git-path info/exclude 2>/dev/null) || return 0
+  mkdir -p "$(dirname "$exclude_file")"
+  if ! grep -Fxq '*.local-backup-*' "$exclude_file" 2>/dev/null; then
+    printf '*.local-backup-*\n' >> "$exclude_file"
   fi
-
-  local path
-  for path in "${backups[@]}"; do
-    git rm -rf --cached --ignore-unmatch -- "$path" >/dev/null 2>&1 || true
-    rm -rf -- "$path"
-  done
-  echo "Temporary backups removed: ${backups[*]}" >&2
+  git ls-files -z -- '*.local-backup-*' | xargs -0 -r git rm --cached -q --ignore-unmatch -- 2>/dev/null || true
+  echo "Local backups ('*.local-backup-*') kept on disk and excluded from commits; remove them yourself once you confirm they are no longer needed." >&2
 }
 
 ensure_token_gitignore() {
@@ -2852,7 +2982,7 @@ push_with_credentials() {
   
   local -a push_cmd=(git push -u origin "$branch")
   if [[ -n "$force_flag" ]]; then
-    push_cmd+=("$force_flag")
+    push_cmd+=("--force-with-lease=refs/heads/${branch}:${__FORCE_LEASE_SHA:-}")
   fi
 
   if [[ "${GITHUB_REMOTE_PROTOCOL:-https}" == "https" ]]; then
@@ -2894,8 +3024,8 @@ push_with_credentials() {
       push_with_credentials "$branch"
       return $?
     elif [[ $secret_status -eq 2 ]]; then
-      echo "Deep history cleaned. Retrying push with --force..." >&2
-      push_with_credentials "$branch" "--force"
+      echo "Deep history cleaned. Retrying push with --force-with-lease..." >&2
+      push_with_credentials "$branch" "--force-with-lease"
       return $?
     fi
 
@@ -3019,11 +3149,14 @@ auto_resolve_rebase_conflicts() {
     fi
   done
 
-  if git rebase --continue >/tmp/rebase-continue.log 2>&1; then
-    cat /tmp/rebase-continue.log
-    rm -f /tmp/rebase-continue.log
+  local rebase_log
+  rebase_log=$(mktemp)
+  if git rebase --continue >"$rebase_log" 2>&1; then
+    cat "$rebase_log"
+    rm -f "$rebase_log"
     return 0
   fi
+  rm -f "$rebase_log"
 
   abort_rebase_with_warning "Unable to complete the rebase automatically."
   return 1

@@ -26,3 +26,12 @@
   - recuperação de gitdir quebrado recria repo isolado da subpasta (`ISOLATED_GIT_DIR=ok`, `ISOLATED_CHECK=ok`).
 - `./create_and_push_repo.sh verify-parent-topics` agora retorna `Unknown action`, comprovando remoção da flag dedicada.
 - O script passou a chamar `run_parent_topic_verifier_auto` automaticamente dentro dos fluxos existentes de push que envolvem codex.
+
+## hardening 2026-10-11
+- `delete_remote_repo` so apaga no GitHub com `ALLOW_REMOTE_DELETE=1` (antes apagava o repo cujo nome de pasta estivesse na lista de ignorados, como build, go, logs, cache).
+- Varredura de segredo no conteudo em stage (`scan_staged_for_secrets`, `SECRET_SCAN=0` desliga) antes do commit; arquivo suspeito fica fora do commit, os demais seguem. Padroes de nome novos: `*.key`, `*.pfx`, `*.ppk`.
+- Reescrita de historico por segredo faz backup em `.git/pre-secret-cleanup-*.bundle` e usa `--force-with-lease` com o SHA remoto anterior (antes `--force`); `SECRET_FIX_MAX_RETRIES` agora limita as tentativas (antes era ignorado e a recursao nao tinha teto).
+- `commit_submodule_safely` nunca faz `--amend` (podia reescrever commit ja publicado); pull --rebase de submodule que falha e abortado em vez de deixar rebase em andamento.
+- `.git` inutilizavel de subpasta e movido para `.git/broken-gitdirs/` em vez de `rm -rf`; backups `*.local-backup-*` nao sao mais apagados (ficam no disco, fora do commit).
+- `curl` com timeout (`CURL_CONNECT_TIMEOUT`, `CURL_MAX_TIME`) e token fora da linha de comando; `web-ext` so e exigido na submissao ao AMO; log do rebase via `mktemp`.
+- Testado em sandbox com remoto local que rejeita segredos (GH013): historico reescrito, bundle verificado, lease obsoleto recusado.
