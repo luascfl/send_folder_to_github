@@ -26,3 +26,5 @@ pycache
 gcp-oauth.keys.json,
 gemini-gcloud-key.json
 gcp-oauth.keys.json
+.context/workflow/ralph/
+.context/workflow/archive/
