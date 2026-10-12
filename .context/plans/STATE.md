@@ -35,3 +35,9 @@
 - `.git` inutilizavel de subpasta e movido para `.git/broken-gitdirs/` em vez de `rm -rf`; backups `*.local-backup-*` nao sao mais apagados (ficam no disco, fora do commit).
 - `curl` com timeout (`CURL_CONNECT_TIMEOUT`, `CURL_MAX_TIME`) e token fora da linha de comando; `web-ext` so e exigido na submissao ao AMO; log do rebase via `mktemp`.
 - Testado em sandbox com remoto local que rejeita segredos (GH013): historico reescrito, bundle verificado, lease obsoleto recusado.
+
+## pull-recursive 2026-10-11
+- Nova acao `create_and_push_repo.sh pull-recursive` (rodar na pasta alvo, ex. `~/Downloads`): espelha os repos do GitHub. Hubs (topic `hub`) e `codex_*` vao primeiro; filhos sao os repos com topic `parent-<hub>` ou listados no `.subcontainers` do hub (le pela API quando o hub ainda nao existe no disco); hubs aninhados recursam (`PULL_MAX_DEPTH`, padrao 4). Depois os demais repos.
+- Repo ja existente em qualquer subpasta (achado pela URL do origin, nao pelo nome da pasta) so recebe `fetch` e `merge --ff-only`. Nada de reset, stash ou sobrescrita: HEAD destacado, divergencia, mudanca local conflitante e pasta sem `.git` sao so reportados.
+- Filho ausente declarado em `.gitmodules` entra por `submodule update --init` e volta para o branch quando e fast-forward; senao e clonado na pasta do hub.
+- `PULL_DRY_RUN=1` mostra o plano sem alterar nada.

@@ -83,6 +83,11 @@ CURL_CONNECT_TIMEOUT=${CURL_CONNECT_TIMEOUT:-15}
 CURL_MAX_TIME=${CURL_MAX_TIME:-120}
 __SECRET_FIX_ATTEMPTS=0                         # shared budget for automatic secret/LFS fixes (SECRET_FIX_MAX_RETRIES)
 __FORCE_LEASE_SHA=""                            # remote tip recorded before a history rewrite, used by --force-with-lease
+PULL_DRY_RUN=${PULL_DRY_RUN:-0}                 # 1: pull-recursive only prints what it would clone/update
+PULL_MAX_DEPTH=${PULL_MAX_DEPTH:-4}             # how many hub levels pull-recursive follows
+PULL_BASE=""
+declare -A __PULL_TOPICS=() __PULL_BRANCH=() __PULL_PRESENT=() __PULL_DONE=() __PULL_PARENT_OF=() __PULL_ROOT_BY_TOPIC=()
+declare -a __PULL_NAMES=() __PULL_RESULTS=()
 
 # curl wrapper: adds timeouts and keeps the Authorization header out of the process list.
 curl() {
@@ -316,6 +321,11 @@ Available Actions:
   push-recursive  : Pushes managed subfolders recursively. A GitHub
                     `hub` topic makes a repository manage its children;
                     Firefox extensions are detected automatically.
+  pull-recursive  : Mirrors your GitHub repositories into the current directory
+                    (clone what is missing, fast-forward what exists). Hubs
+                    (topic `hub`) and codex_* repos go first; their children
+                    (topic parent-<hub>, or listed in .subcontainers) are placed
+                    inside them. Never resets, stashes or overwrites local work.
   reauth          : Updates GitHub/AMO credentials.
   -h, --help      : Shows this help message.
 
@@ -387,9 +397,9 @@ main() {
   fi
 
   case "$action" in
-    push|push-recursive|reauth) ;;
+    push|push-recursive|pull-recursive|reauth) ;;
     *)
-      echo "Unknown action '$action'. Use push, push-recursive, or reauth." >&2
+      echo "Unknown action '$action'. Use push, push-recursive, pull-recursive, or reauth." >&2
       exit 1
       ;;
   esac
@@ -406,6 +416,10 @@ main() {
   case "$action" in
     push-recursive)
       push_recursive_all
+      return
+      ;;
+    pull-recursive)
+      pull_recursive_all
       return
       ;;
   esac
@@ -1900,6 +1914,258 @@ push_recursive_all() {
   fi
 
   run_parent_topic_verifier_auto "$base_dir"
+}
+
+# Pull / mirror ---------------------------------------------------------------
+pull_note() {
+  local status=$1 where=$2 detail=${3:-}
+  __PULL_RESULTS+=("$status|$where|$detail")
+  printf '  [%s] %s%s\n' "$status" "$where" "${detail:+ ($detail)}" >&2
+}
+
+pull_list_remote_repos() {
+  local page=1 tmp code name topics branch
+  tmp=$(mktemp)
+  __PULL_NAMES=()
+  __PULL_TOPICS=()
+  __PULL_BRANCH=()
+  while (( page <= 30 )); do
+    code=$(curl -sS -o "$tmp" -w '%{http_code}' \
+      -H "Authorization: token $GITHUB_TOKEN" \
+      -H "Accept: application/vnd.github+json" \
+      "$GITHUB_API_URL/user/repos?per_page=100&page=$page&affiliation=owner") || code=000
+    if [[ "$code" != "200" ]]; then
+      echo "Falha ao listar repositorios (HTTP $code, pagina $page)." >&2
+      rm -f "$tmp"
+      return 1
+    fi
+    [[ "$(jq 'length' "$tmp")" -gt 0 ]] || break
+    while IFS=$'\t' read -r name topics branch; do
+      [[ -n "$name" ]] || continue
+      [[ "$topics" == "-" ]] && topics=""
+      __PULL_NAMES+=("$name")
+      __PULL_TOPICS["$name"]=$topics
+      __PULL_BRANCH["$name"]=$branch
+    done < <(jq -r '.[] | [.name, ((.topics // []) | join(",") | if . == "" then "-" else . end), (.default_branch // "main")] | @tsv' "$tmp")
+    page=$((page + 1))
+  done
+  rm -f "$tmp"
+  (( ${#__PULL_NAMES[@]} > 0 ))
+}
+
+# Maps repo name -> local path for every git worktree under $1, matched by origin URL (folder names may differ).
+pull_scan_local() {
+  local base=$1 gitpath dir url name
+  __PULL_PRESENT=()
+  while IFS= read -r -d '' gitpath; do
+    dir=$(dirname "$gitpath")
+    [[ "$dir" == "$base" ]] && continue
+    url=$(git -C "$dir" remote get-url origin 2>/dev/null || true)
+    if [[ "$url" =~ github\.com[/:]${GITHUB_OWNER:-luascfl}/([^/]+)$ ]]; then
+      name=${BASH_REMATCH[1]%.git}
+    else
+      name=$(basename "$dir")
+    fi
+    [[ -z "${__PULL_PRESENT[$name]+_}" ]] && __PULL_PRESENT["$name"]=$dir
+  done < <(find "$base" -maxdepth 8 \( -type d \( -name node_modules -o -name .cache -o -name .aligntrue -o -name '.venv*' -o -name venv \) -prune \) -o -name .git -prune -print0 2>/dev/null)
+  return 0
+}
+
+# Fast-forward only: a refused merge (local edits in the way, divergence) is reported and nothing is touched.
+pull_update_repo() {
+  local dir=$1 label=$2 branch up behind ahead
+  if [[ "$PULL_DRY_RUN" == "1" ]]; then
+    pull_note "dry-run" "$label" "atualizaria"
+    return 0
+  fi
+  branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+  if [[ -z "$branch" || "$branch" == "HEAD" ]]; then
+    pull_note "ignorado" "$label" "HEAD destacado"
+    return 0
+  fi
+  if ! run_git_with_credentials git -C "$dir" fetch -q origin >/dev/null 2>&1; then
+    pull_note "falhou" "$label" "fetch"
+    return 0
+  fi
+  up=$(git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
+  if [[ -z "$up" ]]; then
+    if git -C "$dir" rev-parse -q --verify "refs/remotes/origin/$branch" >/dev/null 2>&1; then
+      up="origin/$branch"
+    else
+      pull_note "ignorado" "$label" "branch $branch sem remoto"
+      return 0
+    fi
+  fi
+  read -r behind ahead < <(git -C "$dir" rev-list --left-right --count "$up...HEAD" 2>/dev/null || echo "0 0")
+  if (( behind == 0 )); then
+    pull_note "em dia" "$label" "$( (( ahead > 0 )) && echo "$ahead commit(s) local(is) nao enviado(s)" || true)"
+  elif (( ahead > 0 )); then
+    pull_note "divergiu" "$label" "$behind atras, $ahead a frente; nada alterado"
+  elif git -C "$dir" merge --ff-only -q "$up" >/dev/null 2>&1; then
+    pull_note "atualizado" "$label" "+$behind commit(s)"
+  else
+    pull_note "recusado" "$label" "mudancas locais conflitam com o remoto; nada alterado"
+  fi
+  return 0
+}
+
+# After 'submodule update' the child sits on a detached HEAD; put it back on its branch when that is a pure fast-forward.
+pull_attach_branch() {
+  local dir=$1 name=$2 branch=${__PULL_BRANCH[$2]:-main}
+  git -C "$dir" rev-parse -q --verify "refs/remotes/origin/$branch" >/dev/null 2>&1 || return 0
+  git -C "$dir" merge-base --is-ancestor HEAD "origin/$branch" >/dev/null 2>&1 || return 0
+  git -C "$dir" checkout -q -B "$branch" "origin/$branch" >/dev/null 2>&1 || true
+}
+
+# Clone, init as declared submodule, or update $dest. $4/$5: parent repo dir and subdir when nested in a hub.
+pull_materialize() {
+  local name=$1 dest=$2 parent=${3:-} subdir=${4:-} existing label err
+  existing=${__PULL_PRESENT[$name]:-}
+  label=${dest#"$PULL_BASE"/}
+  if [[ -n "$existing" ]]; then
+    pull_update_repo "$existing" "${existing#"$PULL_BASE"/}"
+    return 0
+  fi
+  if [[ -e "$dest/.git" ]]; then
+    __PULL_PRESENT["$name"]=$dest
+    pull_update_repo "$dest" "$label"
+    return 0
+  fi
+  if [[ -d "$dest" && -n "$(ls -A "$dest" 2>/dev/null)" ]]; then
+    pull_note "ignorado" "$label" "pasta existe sem .git; nao toquei"
+    return 0
+  fi
+  if [[ "$PULL_DRY_RUN" == "1" ]]; then
+    pull_note "dry-run" "$label" "clonaria $name"
+    return 0
+  fi
+  mkdir -p "$(dirname "$dest")"
+  if [[ -n "$parent" && -d "$parent/.git" || -n "$parent" && -f "$parent/.git" ]] && ( cd "$parent" && is_declared_submodule_path "$subdir" ); then
+    if run_git_with_credentials git -C "$parent" submodule update --init -- "$subdir" >/dev/null 2>&1 && [[ -e "$dest/.git" ]]; then
+      pull_attach_branch "$dest" "$name"
+      __PULL_PRESENT["$name"]=$dest
+      pull_note "submodule" "$label" "iniciado a partir do pai"
+      return 0
+    fi
+  fi
+  if err=$(run_git_with_credentials git clone -q "$(resolve_remote_url "$name")" "$dest" 2>&1); then
+    __PULL_PRESENT["$name"]=$dest
+    pull_note "clonado" "$label"
+  else
+    pull_note "falhou" "$label" "clone: ${err//$'\n'/ }"
+  fi
+  return 0
+}
+
+# Materialize a hub/codex_ root, then place its children inside it (nested hubs recurse).
+pull_process_root() {
+  local name=$1 dest=$2 depth=$3 parent=${4:-} subdir=${5:-}
+  [[ -n "${__PULL_DONE[$name]+_}" ]] && return 0
+  __PULL_DONE["$name"]=1
+  pull_materialize "$name" "$dest" "$parent" "$subdir"
+  dest=${__PULL_PRESENT[$name]:-$dest}
+  [[ -d "$dest" || "$PULL_DRY_RUN" == "1" ]] || return 0
+  (( depth < PULL_MAX_DEPTH )) || return 0
+
+  local -A sub_for=()
+  local sd rp child sub_text=""
+  if [[ -f "$dest/$SUBCONTAINER_STATE_FILE" ]]; then
+    sub_text=$(<"$dest/$SUBCONTAINER_STATE_FILE")
+  elif [[ "$PULL_DRY_RUN" == "1" ]]; then
+    sub_text=$(curl -sS -f -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.raw" \
+      "$GITHUB_API_URL/repos/${GITHUB_OWNER:-luascfl}/$name/contents/$SUBCONTAINER_STATE_FILE" 2>/dev/null || true)
+  fi
+  while IFS='|' read -r sd rp || [[ -n "${sd:-}" ]]; do
+    [[ -n "${sd:-}" && -n "${rp:-}" && -n "${__PULL_TOPICS[$rp]+_}" ]] && sub_for["$rp"]=$sd
+  done <<<"$sub_text"
+  local -a children=()
+  for child in "${__PULL_NAMES[@]}"; do
+    [[ "$child" == "$name" ]] && continue
+    if [[ "${__PULL_PARENT_OF[$child]:-}" == "$name" ]] || [[ -n "${sub_for[$child]+_}" && -z "${__PULL_PARENT_OF[$child]:-}" ]]; then
+      children+=("$child")
+    fi
+  done
+  for child in "${children[@]}"; do
+    sd=${sub_for[$child]:-$child}
+    if [[ -n "${__PULL_ROOT_BY_TOPIC[$(build_parent_repo_topic "$child")]+_}" ]] || [[ ",${__PULL_TOPICS[$child]}," == *",hub,"* ]]; then
+      pull_process_root "$child" "$dest/$sd" $((depth + 1)) "$dest" "$sd"
+    elif [[ -z "${__PULL_DONE[$child]+_}" ]]; then
+      __PULL_DONE["$child"]=1
+      pull_materialize "$child" "$dest/$sd" "$dest" "$sd"
+    fi
+  done
+  return 0
+}
+
+pull_recursive_all() {
+  PULL_BASE=$(pwd)
+  __PULL_RESULTS=()
+  __PULL_DONE=()
+  __PULL_PARENT_OF=()
+  __PULL_ROOT_BY_TOPIC=()
+  echo "==> Pull recursivo em $PULL_BASE${PULL_DRY_RUN:+ (PULL_DRY_RUN=$PULL_DRY_RUN)}" >&2
+  if ! pull_list_remote_repos; then
+    return 1
+  fi
+  pull_scan_local "$PULL_BASE"
+
+  local name topic root
+  local -a hubs=() codex=()
+  for name in "${__PULL_NAMES[@]}"; do
+    if [[ ",${__PULL_TOPICS[$name]}," == *",hub,"* ]]; then
+      hubs+=("$name")
+    elif [[ "$name" == codex_* ]]; then
+      codex+=("$name")
+    else
+      continue
+    fi
+    __PULL_ROOT_BY_TOPIC["$(build_parent_repo_topic "$name")"]=$name
+  done
+  # A repo whose parent-<root> topic names an existing root is that root's child.
+  local t
+  for name in "${__PULL_NAMES[@]}"; do
+    IFS=',' read -r -a _topics <<<"${__PULL_TOPICS[$name]}"
+    for t in "${_topics[@]}"; do
+      [[ "$t" == parent-* ]] || continue
+      root=${__PULL_ROOT_BY_TOPIC[$t]:-}
+      if [[ -n "$root" && "$root" != "$name" ]]; then
+        __PULL_PARENT_OF["$name"]=$root
+        break
+      fi
+    done
+  done
+
+  echo "==> Hubs e codex_ primeiro (${#hubs[@]} hubs, ${#codex[@]} codex_)..." >&2
+  for name in "${hubs[@]}" "${codex[@]}"; do
+    [[ -n "${__PULL_PARENT_OF[$name]:-}" ]] && continue
+    remote_should_be_ignored "$name" && continue
+    pull_process_root "$name" "$PULL_BASE/$name" 0
+  done
+
+  echo "==> Demais repositorios..." >&2
+  for name in "${__PULL_NAMES[@]}"; do
+    [[ -n "${__PULL_DONE[$name]+_}" ]] && continue
+    [[ -n "${__PULL_PARENT_OF[$name]:-}" ]] && continue
+    remote_should_be_ignored "$name" && continue
+    __PULL_DONE["$name"]=1
+    pull_materialize "$name" "$PULL_BASE/$name"
+  done
+
+  local entry status n_fail=0
+  local -A counts=()
+  for entry in "${__PULL_RESULTS[@]}"; do
+    status=${entry%%|*}
+    counts["$status"]=$(( ${counts[$status]:-0} + 1 ))
+    [[ "$status" == falhou ]] && n_fail=$((n_fail + 1))
+  done
+  printf '\npull-recursive summary:\n' >&2
+  for status in "${!counts[@]}"; do printf '  %-11s %s\n' "$status" "${counts[$status]}" >&2; done
+  for entry in "${__PULL_RESULTS[@]}"; do
+    case "${entry%%|*}" in
+      divergiu|recusado|ignorado|falhou) printf '  atencao: %s\n' "$entry" >&2 ;;
+    esac
+  done
+  (( n_fail == 0 ))
 }
 
 prepare_subcontainer_plan() {
