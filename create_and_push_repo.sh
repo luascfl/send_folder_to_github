@@ -86,7 +86,7 @@ __FORCE_LEASE_SHA=""                            # remote tip recorded before a h
 PULL_DRY_RUN=${PULL_DRY_RUN:-0}                 # 1: pull-recursive only prints what it would clone/update
 PULL_MAX_DEPTH=${PULL_MAX_DEPTH:-4}             # how many hub levels pull-recursive follows
 PULL_BASE=""
-declare -A __PULL_TOPICS=() __PULL_BRANCH=() __PULL_PRESENT=() __PULL_DONE=() __PULL_PARENT_OF=() __PULL_ROOT_BY_TOPIC=()
+declare -A __PULL_TOPICS=() __PULL_BRANCH=() __PULL_PRESENT=() __PULL_DONE=() __PULL_PARENT_OF=() __PULL_ROOT_BY_TOPIC=() __PULL_SUBMAP=() __PULL_IS_ROOT=()
 declare -a __PULL_NAMES=() __PULL_RESULTS=()
 
 # curl wrapper: adds timeouts and keeps the Authorization header out of the process list.
@@ -1966,7 +1966,11 @@ pull_scan_local() {
     else
       name=$(basename "$dir")
     fi
-    [[ -z "${__PULL_PRESENT[$name]+_}" ]] && __PULL_PRESENT["$name"]=$dir
+    local cur=${__PULL_PRESENT[$name]:-} shallow_a=${dir//[^\/]/} shallow_b
+    shallow_b=${cur//[^\/]/}
+    if [[ -z "$cur" || ${#shallow_a} -lt ${#shallow_b} ]]; then
+      __PULL_PRESENT["$name"]=$dir
+    fi
   done < <(find "$base" -maxdepth 8 \( -type d \( -name node_modules -o -name .cache -o -name .aligntrue -o -name '.venv*' -o -name venv \) -prune \) -o -name .git -prune -print0 2>/dev/null)
   return 0
 }
@@ -1983,7 +1987,7 @@ pull_update_repo() {
     pull_note "ignorado" "$label" "HEAD destacado"
     return 0
   fi
-  if ! run_git_with_credentials git -C "$dir" fetch -q origin >/dev/null 2>&1; then
+  if ! pull_retry run_git_with_credentials git -C "$dir" fetch -q origin >/dev/null 2>&1; then
     pull_note "falhou" "$label" "fetch"
     return 0
   fi
@@ -2020,15 +2024,15 @@ pull_attach_branch() {
 # Clone, init as declared submodule, or update $dest. $4/$5: parent repo dir and subdir when nested in a hub.
 pull_materialize() {
   local name=$1 dest=$2 parent=${3:-} subdir=${4:-} existing label err
-  existing=${__PULL_PRESENT[$name]:-}
   label=${dest#"$PULL_BASE"/}
-  if [[ -n "$existing" ]]; then
-    pull_update_repo "$existing" "${existing#"$PULL_BASE"/}"
-    return 0
-  fi
   if [[ -e "$dest/.git" ]]; then
     __PULL_PRESENT["$name"]=$dest
     pull_update_repo "$dest" "$label"
+    return 0
+  fi
+  existing=${__PULL_PRESENT[$name]:-}
+  if [[ -n "$existing" && -e "$existing/.git" ]]; then
+    pull_update_repo "$existing" "${existing#"$PULL_BASE"/}"
     return 0
   fi
   if [[ -d "$dest" && -n "$(ls -A "$dest" 2>/dev/null)" ]]; then
@@ -2048,13 +2052,43 @@ pull_materialize() {
       return 0
     fi
   fi
-  if err=$(run_git_with_credentials git clone -q "$(resolve_remote_url "$name")" "$dest" 2>&1); then
+  if err=$(pull_retry run_git_with_credentials git clone -q "$(resolve_remote_url "$name")" "$dest" 2>&1); then
     __PULL_PRESENT["$name"]=$dest
     pull_note "clonado" "$label"
   else
     pull_note "falhou" "$label" "clone: ${err//$'\n'/ }"
   fi
   return 0
+}
+
+# Retries transient failures (DNS, timeouts) up to 3 times with a growing pause.
+pull_retry() {
+  local n
+  for n in 1 2 3; do
+    "$@" && return 0
+    (( n < 3 )) && sleep $((n * 3))
+  done
+  return 1
+}
+
+# "<subdir>|<repo>" lines of a hub: the GitHub copy of .subcontainers plus the local one when present.
+pull_load_subcontainers() {
+  local name=$1 dir tmp code n text=""
+  tmp=$(mktemp)
+  for n in 1 2 3; do
+    code=$(curl -sS -o "$tmp" -w '%{http_code}' -H "Authorization: token $GITHUB_TOKEN" \
+      -H "Accept: application/vnd.github.raw" \
+      "$GITHUB_API_URL/repos/${GITHUB_OWNER:-luascfl}/$name/contents/$SUBCONTAINER_STATE_FILE" 2>/dev/null) || code=000
+    [[ "$code" == 200 || "$code" == 404 ]] && break
+    sleep $((n * 2))
+  done
+  [[ "$code" == 200 ]] && text=$(<"$tmp")
+  rm -f "$tmp"
+  dir=${__PULL_PRESENT[$name]:-$PULL_BASE/$name}
+  if [[ -f "$dir/$SUBCONTAINER_STATE_FILE" ]]; then
+    text+=$'\n'$(<"$dir/$SUBCONTAINER_STATE_FILE")
+  fi
+  printf '%s' "$text"
 }
 
 # Materialize a hub/codex_ root, then place its children inside it (nested hubs recurse).
@@ -2068,26 +2102,17 @@ pull_process_root() {
   (( depth < PULL_MAX_DEPTH )) || return 0
 
   local -A sub_for=()
-  local sd rp child sub_text=""
-  if [[ -f "$dest/$SUBCONTAINER_STATE_FILE" ]]; then
-    sub_text=$(<"$dest/$SUBCONTAINER_STATE_FILE")
-  elif [[ "$PULL_DRY_RUN" == "1" ]]; then
-    sub_text=$(curl -sS -f -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.raw" \
-      "$GITHUB_API_URL/repos/${GITHUB_OWNER:-luascfl}/$name/contents/$SUBCONTAINER_STATE_FILE" 2>/dev/null || true)
-  fi
+  local sd rp child
   while IFS='|' read -r sd rp || [[ -n "${sd:-}" ]]; do
-    [[ -n "${sd:-}" && -n "${rp:-}" && -n "${__PULL_TOPICS[$rp]+_}" ]] && sub_for["$rp"]=$sd
-  done <<<"$sub_text"
+    [[ -n "${sd:-}" && -n "${rp:-}" ]] && sub_for["$rp"]=$sd
+  done <<<"${__PULL_SUBMAP[$name]:-}"
   local -a children=()
   for child in "${__PULL_NAMES[@]}"; do
-    [[ "$child" == "$name" ]] && continue
-    if [[ "${__PULL_PARENT_OF[$child]:-}" == "$name" ]] || [[ -n "${sub_for[$child]+_}" && -z "${__PULL_PARENT_OF[$child]:-}" ]]; then
-      children+=("$child")
-    fi
+    [[ "${__PULL_PARENT_OF[$child]:-}" == "$name" ]] && children+=("$child")
   done
   for child in "${children[@]}"; do
     sd=${sub_for[$child]:-$child}
-    if [[ -n "${__PULL_ROOT_BY_TOPIC[$(build_parent_repo_topic "$child")]+_}" ]] || [[ ",${__PULL_TOPICS[$child]}," == *",hub,"* ]]; then
+    if [[ -n "${__PULL_IS_ROOT[$child]+_}" ]]; then
       pull_process_root "$child" "$dest/$sd" $((depth + 1)) "$dest" "$sd"
     elif [[ -z "${__PULL_DONE[$child]+_}" ]]; then
       __PULL_DONE["$child"]=1
@@ -2103,7 +2128,9 @@ pull_recursive_all() {
   __PULL_DONE=()
   __PULL_PARENT_OF=()
   __PULL_ROOT_BY_TOPIC=()
-  echo "==> Pull recursivo em $PULL_BASE${PULL_DRY_RUN:+ (PULL_DRY_RUN=$PULL_DRY_RUN)}" >&2
+  __PULL_SUBMAP=()
+  __PULL_IS_ROOT=()
+  echo "==> Pull recursivo em $PULL_BASE$([[ "$PULL_DRY_RUN" == "1" ]] && echo " (dry-run)")" >&2
   if ! pull_list_remote_repos; then
     return 1
   fi
@@ -2120,6 +2147,7 @@ pull_recursive_all() {
       continue
     fi
     __PULL_ROOT_BY_TOPIC["$(build_parent_repo_topic "$name")"]=$name
+    __PULL_IS_ROOT["$name"]=1
   done
   # A repo whose parent-<root> topic names an existing root is that root's child.
   local t
@@ -2133,6 +2161,17 @@ pull_recursive_all() {
         break
       fi
     done
+  done
+  # Children of every root, read before anything is cloned, so nested hubs are never cloned at top level.
+  local rt text sd rp
+  for rt in "${hubs[@]}" "${codex[@]}"; do
+    text=$(pull_load_subcontainers "$rt")
+    __PULL_SUBMAP["$rt"]=$text
+    while IFS='|' read -r sd rp || [[ -n "${sd:-}" ]]; do
+      [[ -n "${sd:-}" && -n "${rp:-}" && "$rp" != "$rt" && -n "${__PULL_TOPICS[$rp]+_}" ]] || continue
+      [[ "${__PULL_PARENT_OF[$rt]:-}" == "$rp" ]] && continue
+      [[ -z "${__PULL_PARENT_OF[$rp]:-}" ]] && __PULL_PARENT_OF["$rp"]=$rt
+    done <<<"$text"
   done
 
   echo "==> Hubs e codex_ primeiro (${#hubs[@]} hubs, ${#codex[@]} codex_)..." >&2

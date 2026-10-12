@@ -41,3 +41,4 @@
 - Repo ja existente em qualquer subpasta (achado pela URL do origin, nao pelo nome da pasta) so recebe `fetch` e `merge --ff-only`. Nada de reset, stash ou sobrescrita: HEAD destacado, divergencia, mudanca local conflitante e pasta sem `.git` sao so reportados.
 - Filho ausente declarado em `.gitmodules` entra por `submodule update --init` e volta para o branch quando e fast-forward; senao e clonado na pasta do hub.
 - `PULL_DRY_RUN=1` mostra o plano sem alterar nada.
+- Correcoes do pull-recursive: o destino esperado (`<hub>/<filho>/.git`) vale antes de qualquer copia achada em outro lugar, e o scan guarda o caminho mais raso por repo; o `.subcontainers` de cada hub e lido pela API (mais a copia local) antes da fase 1, entao filhos de hubs nao `codex_*` e hubs aninhados nunca viram clone de nivel superior; fetch, clone e leitura do `.subcontainers` repetem ate 3 vezes em erro de rede.
